@@ -3,10 +3,9 @@ module github.com/bbmumford/tursoraft
 go 1.24.0
 
 require (
+	github.com/bbmumford/go-libsql v0.0.1
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/maozhijie/go-libsql v0.0.0-20251223092426-ef6c4dddaf25 // Windows support
-	github.com/tursodatabase/go-libsql v0.0.0-20251219133454-43644db490ff // macOS/Linux
 	github.com/tursodatabase/libsql-client-go v0.0.0-20240902231107-85af5b9d094d
 )
 
