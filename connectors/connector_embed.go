@@ -1,5 +1,4 @@
-//go:build libsql_embed && !windows
-// +build libsql_embed,!windows
+//go:build libsql_embed
 
 package connectors
 
@@ -11,7 +10,7 @@ import (
 	"time"
 
 	"github.com/bbmumford/tursoraft/database"
-	"github.com/tursodatabase/go-libsql"
+	"github.com/bbmumford/go-libsql"
 )
 
 // Note: This file uses the public database package which mirrors internal/database
