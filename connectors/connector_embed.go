@@ -6,28 +6,34 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bbmumford/tursoraft/database"
-	"github.com/bbmumford/go-libsql"
+	turso "turso.tech/database/tursogo"
 )
 
-// Note: This file uses the public database package which mirrors internal/database
-
-// MakeConnector creates database handles supporting embedded libSQL when
+// MakeConnector creates database handles supporting embedded Turso when
 // built with the libsql_embed tag.
+//
+// Backed by turso.tech/database/tursogo — the official, pure-Go Turso SDK
+// (no CGO, cross-platform). Replaces the legacy bbmumford/go-libsql and
+// maozhijie/go-libsql forks; one Windows-specific file is no longer
+// required because tursogo builds identically on all supported targets.
 //
 // Purpose: LOCAL REPLICA mode with optional Turso synchronization
 //
 // This is an ALTERNATIVE to the remote connector. It provides:
 //   - Local SQLite database files
-//   - Embedded libSQL engine (no network for reads)
-//   - Optional sync to Turso primary
+//   - Embedded Turso engine (no network for reads)
+//   - Optional sync to Turso primary via explicit Pull()
 //   - Ultra-low latency queries
 //
 // Build Configuration:
-//   - Default build: Uses connector_remote.go (Turso queries)
+//   - Default build: Uses connector_remote.go (libsql-client-go remote)
 //   - Build with -tags libsql_embed: Uses this file (local replicas)
 //
 // Two Modes Supported:
@@ -35,7 +41,7 @@ import (
 //  1. Pure Local Mode (no Turso):
 //     - primaryURL = ""
 //     - authToken = ""
-//     - Uses local SQLite file only
+//     - Uses local Turso file only via sql.Open("turso", path)
 //     - No cloud sync
 //     - For testing/development/mesh-ephemeral state
 //
@@ -43,40 +49,38 @@ import (
 //     - primaryURL = Turso database URL
 //     - authToken = database auth token
 //     - Creates local SQLite replica
-//     - Syncs from Turso primary every 30 seconds
+//     - WithSync callback invokes syncDb.Pull(ctx)
 //     - Reads from local replica (fast)
 //     - Writes go to Turso (coordinated via Raft)
 //
-// Why Embedded Replicas?
-//   - Ultra-low read latency (local disk)
-//   - Reduced Turso API calls
-//   - Works offline for reads
-//   - Better performance for read-heavy workloads
-//
 // Sync Mechanism:
-//   - Uses go-libsql embedded replica connector
-//   - Downloads WAL frames from Turso
-//   - Applies changes to local SQLite file
-//   - Automatic sync every 30 seconds
-//   - Manual sync via SyncDatabase()
+//   - Uses tursogo's NewTursoSyncDb with explicit Push/Pull
+//   - Replaces go-libsql's continuous WithSyncInterval with caller-driven
+//     Pull (handle.WithSync). Raft already drives sync points; the 30s
+//     ticker that the legacy connector added on top is redundant when
+//     consensus events trigger sync explicitly.
 //
-// Trade-offs vs Remote Mode:
-//   - Much faster reads (local disk vs network)
-//   - Reduced bandwidth usage
-//   - Offline read capability
-//   - Larger disk footprint (full database copies)
-//   - Eventual consistency for reads (sync lag)
-//   - More complex dependency (go-libsql)
+// Encryption-at-rest:
+//
+//	Pure local mode: supported via DSN options
+//	  ?experimental=encryption&encryption_cipher=aes256gcm&encryption_hexkey=…
+//
+//	Embedded replica mode: NOT yet exposed on tursogo's high-level
+//	NewTursoSyncDb API. The encryptionKey parameter is preserved as a
+//	skeleton and a warning is logged when set. This matches the user
+//	policy of "drop with skeleton" until upstream surfaces it.
 //
 // Build Command:
 //
 //	go build -tags libsql_embed ./...
 //
 // Parameters:
-//   - dbPath: Local SQLite file path
+//   - dbPath: Local Turso file path
 //   - primaryURL: Turso database URL (empty for pure local)
 //   - authToken: Database auth token (empty for pure local)
-//   - encryptionKey: Optional encryption key for data-at-rest (empty to disable)
+//   - encryptionKey: Optional hex-encoded encryption key. Honored in
+//     pure-local mode; logged-but-skeletal in embedded-replica mode
+//     (until upstream tursogo surfaces it).
 //
 // Returns:
 //   - *database.DatabaseHandle: Handle with embedded replica
@@ -90,13 +94,10 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 
 	// Purely local embedded mode (no primary).
 	if primaryURL == "" && authToken == "" {
-		dsn := fmt.Sprintf("file:%s", dbPath)
-		if encryptionKey != "" {
-			dsn += fmt.Sprintf("?encryption_key=%s", encryptionKey)
-		}
-		db, err := sql.Open("libsql", dsn)
+		dsn := buildLocalDSN(dbPath, encryptionKey)
+		db, err := sql.Open("turso", dsn)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open embedded libSQL at %s: %w", dbPath, err)
+			return nil, fmt.Errorf("failed to open embedded Turso at %s: %w", dbPath, err)
 		}
 		handle := database.NewDatabaseHandle(db)
 		handle.WithSync(func(ctx context.Context) error {
@@ -117,32 +118,67 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 		return nil, fmt.Errorf("auth token cannot be empty (for remote mode)")
 	}
 
-	opts := []libsql.Option{libsql.WithAuthToken(authToken)}
-
-	// Add encryption if key provided
+	// Embedded replica with sync. Encryption-on-sync is a known gap in
+	// tursogo's high-level API — log a warning so operators know the
+	// data is unencrypted at rest on this code path.
 	if encryptionKey != "" {
-		opts = append(opts, libsql.WithEncryption(encryptionKey))
+		log.Printf("[tursoraft] WARNING: encryptionKey set with embedded replica — sync-mode encryption is not yet supported by tursogo; storing unencrypted")
 	}
 
-	// Provide a modest sync interval so replicas stay warm but avoid chatter.
-	opts = append(opts, libsql.WithSyncInterval(30*time.Second))
-	connector, err := libsql.NewEmbeddedReplicaConnector(dbPath, primaryURL, opts...)
+	syncCtx := context.Background()
+	syncDb, err := turso.NewTursoSyncDb(syncCtx, turso.TursoSyncDbConfig{
+		Path:      dbPath,
+		RemoteUrl: primaryURL,
+		AuthToken: authToken,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create embedded replica connector: %w", err)
+		return nil, fmt.Errorf("failed to create embedded sync db: %w", err)
 	}
-	// sql.OpenDB manages pooling around the libsql connector.
-	db := sql.OpenDB(connector)
+
+	db, err := syncDb.Connect(syncCtx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect embedded sync db: %w", err)
+	}
+
 	handle := database.NewDatabaseHandle(db)
+
+	// handle.WithSync replaces go-libsql's WithSyncInterval — Raft drives
+	// the sync cadence here, so caller-driven Pull is the correct shape.
+	// Push isn't needed: writes flow through the regular *sql.DB and are
+	// committed remotely by tursogo's normal write path.
 	handle.WithSync(func(ctx context.Context) error {
-		// Respect cancellation before invoking Sync.
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		_, err := connector.Sync()
+		_, err := syncDb.Pull(ctx)
 		return err
 	})
-	handle.AddCloser(connector.Close)
+	// tursogo's TursoSyncDb does not (yet) expose a Close method;
+	// closing the *sql.DB releases all resources we allocated.
 	return handle, nil
+}
+
+// buildLocalDSN appends DSN-style encryption options to a local file path
+// when an encryption key is provided. tursogo accepts these query
+// parameters on sql.Open("turso", …):
+//
+//	?experimental=encryption&encryption_cipher=aes256gcm&encryption_hexkey=<hex>
+func buildLocalDSN(path, encryptionHexKey string) string {
+	if encryptionHexKey == "" {
+		return path
+	}
+	q := url.Values{}
+	q.Set("experimental", "encryption")
+	q.Set("encryption_cipher", "aes256gcm")
+	q.Set("encryption_hexkey", encryptionHexKey)
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + q.Encode()
 }
