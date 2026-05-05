@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bbmumford/tursoraft/database"
+	_ "github.com/tursodatabase/libsql-client-go/libsql" // registers "libsql" driver for legacy-server fallback
 	turso "turso.tech/database/tursogo"
 )
 
@@ -86,6 +87,20 @@ import (
 //   - *database.DatabaseHandle: Handle with embedded replica
 //   - error: Creation or connectivity failure
 func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*database.DatabaseHandle, error) {
+	return MakeConnectorForServer(dbPath, primaryURL, "", authToken, encryptionKey)
+}
+
+// MakeConnectorForServer is the version-aware variant. The serverVersion
+// parameter is the value the Turso Platform API reports for the database
+// (e.g. "0.24.29" for legacy sqld, "2026.6.0" for new tursodb). When set to
+// a value beginning with "0.", the connector falls back to libsql-client-go
+// (Hrana over HTTP) because tursogo's sync engine does not speak the legacy
+// sync protocol — its endpoints return 404 on legacy servers.
+//
+// An empty serverVersion preserves the previous behaviour (assume new
+// platform; use tursogo embedded sync). Pure-local mode is independent of
+// version.
+func MakeConnectorForServer(dbPath, primaryURL, serverVersion, authToken, encryptionKey string) (*database.DatabaseHandle, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("database path cannot be empty")
 	}
@@ -116,6 +131,31 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 	}
 	if authToken == "" {
 		return nil, fmt.Errorf("auth token cannot be empty (for remote mode)")
+	}
+
+	// Legacy sqld server (version "0.x"): tursogo's sync engine returns
+	// empty-body 404s on this platform because the new sync endpoints are
+	// not implemented there. Fall back to libsql-client-go remote-only
+	// (Hrana protocol via /v2/pipeline) — the same client the official
+	// Turso Go remote-access example uses. No local replica on this path;
+	// every query is an HTTP round-trip to the cloud.
+	if strings.HasPrefix(serverVersion, "0.") {
+		log.Printf("[tursoraft] %s on legacy sqld %s — using libsql-client-go remote (no local replica)", dbPath, serverVersion)
+		dsn := fmt.Sprintf("%s?authToken=%s", primaryURL, authToken)
+		db, err := sql.Open("libsql", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open libsql remote for %s: %w", dbPath, err)
+		}
+		handle := database.NewDatabaseHandle(db)
+		handle.WithSync(func(ctx context.Context) error {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			return db.PingContext(ctx)
+		})
+		return handle, nil
 	}
 
 	// Embedded replica with sync. Encryption-on-sync is a known gap in
@@ -163,7 +203,8 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 		return err
 	})
 	// tursogo's TursoSyncDb does not (yet) expose a Close method;
-	// closing the *sql.DB releases all resources we allocated.
+	// closing the *sql.DB returned by Connect releases all resources we
+	// allocated here.
 	return handle, nil
 }
 

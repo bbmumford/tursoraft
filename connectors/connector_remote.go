@@ -51,6 +51,13 @@ import (
 //   - *database.DatabaseHandle: Wrapper around *sql.DB for MeshDB operations
 //   - error: Connection or validation errors
 func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*database.DatabaseHandle, error) {
+	return MakeConnectorForServer(dbPath, primaryURL, "", authToken, encryptionKey)
+}
+
+// MakeConnectorForServer mirrors the version-aware signature in the embedded
+// build so manager.go can call it regardless of build tag. In the remote-only
+// build the version is ignored (libsql-client-go is the only path).
+func MakeConnectorForServer(dbPath, primaryURL, _serverVersion, authToken, encryptionKey string) (*database.DatabaseHandle, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("database path cannot be empty")
 	}

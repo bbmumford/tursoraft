@@ -353,17 +353,17 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	// Initialize Turso client and database URLs unless using embedded-only mode
 	var (
 		tursoClient *turso.TursoClient
-		dbURLs      map[string]string
+		dbInfo      map[string]turso.DBInfo
 		err         error
 	)
 	if !cfg.UseEmbedded {
 		tursoClient = turso.NewTursoClient(toInternalTursoConfig(cfg.TursoConfig))
-		dbURLs, err = turso.EnsureAllDBs(ctx, tursoClient, toInternalGroups(cfg.Groups))
+		dbInfo, err = turso.EnsureAllDBs(ctx, tursoClient, toInternalGroups(cfg.Groups))
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure databases: %w", err)
 		}
 	} else {
-		dbURLs = make(map[string]string) // empty; embedded will open local files
+		dbInfo = make(map[string]turso.DBInfo) // empty; embedded will open local files
 	}
 
 	// Create connector manager and paths map
@@ -378,7 +378,9 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 				return nil, fmt.Errorf("mkdir group dir: %w", err)
 			}
 			dbPath := filepath.Join(groupDir, dbName+".db")
-			primaryURL := dbURLs[dbKey]
+			info := dbInfo[dbKey]
+			primaryURL := info.URL
+			serverVersion := info.Version
 			authToken := group.AuthToken
 			encryptionKey := group.EncryptionKey
 
@@ -386,7 +388,7 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 			if group.PureLocal {
 				// Force pure local mode (no Turso sync) regardless of UseEmbedded
 				// Used for ephemeral mesh-only data like auth sessions
-				primaryURL, authToken = "", ""
+				primaryURL, authToken, serverVersion = "", "", ""
 			} else if cfg.UseEmbedded {
 				// Embedded replica mode: local file + Turso sync
 				// Keep primaryURL and authToken for sync
@@ -396,7 +398,7 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 				// Keep primaryURL and authToken
 			}
 
-			handle, err := connectors.MakeConnector(dbPath, primaryURL, authToken, encryptionKey)
+			handle, err := connectors.MakeConnectorForServer(dbPath, primaryURL, serverVersion, authToken, encryptionKey)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create connector for %s: %w", dbKey, err)
 			}
@@ -520,7 +522,7 @@ func NewManagerWithTransport(ctx context.Context, cfg ManagerConfig, transport r
 
 	// Initialize Turso client and ensure DBs
 	tursoClient := turso.NewTursoClient(toInternalTursoConfig(cfg.TursoConfig))
-	dbURLs, err := turso.EnsureAllDBs(ctx, tursoClient, toInternalGroups(cfg.Groups))
+	dbInfo, err := turso.EnsureAllDBs(ctx, tursoClient, toInternalGroups(cfg.Groups))
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure databases: %w", err)
 	}
@@ -536,10 +538,10 @@ func NewManagerWithTransport(ctx context.Context, cfg ManagerConfig, transport r
 				return nil, fmt.Errorf("mkdir group dir: %w", err)
 			}
 			dbPath := filepath.Join(groupDir, dbName+".db")
-			primaryURL := dbURLs[dbKey]
+			info := dbInfo[dbKey]
 			encryptionKey := group.EncryptionKey
 
-			handle, err := connectors.MakeConnector(dbPath, primaryURL, group.AuthToken, encryptionKey)
+			handle, err := connectors.MakeConnectorForServer(dbPath, info.URL, info.Version, group.AuthToken, encryptionKey)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create connector for %s: %w", dbKey, err)
 			}

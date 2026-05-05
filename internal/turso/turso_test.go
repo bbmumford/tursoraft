@@ -34,7 +34,7 @@ func TestEnsureAllDBs_SkipsPureLocalGroups(t *testing.T) {
 		BaseURL:  server.URL,
 	})
 
-	dbURLs, err := EnsureAllDBs(context.Background(), client, []GroupConfig{
+	dbInfo, err := EnsureAllDBs(context.Background(), client, []GroupConfig{
 		{GroupName: "auth-sessions", DBNames: []string{"sessions"}, PureLocal: true},
 		{GroupName: "remote", DBNames: []string{"core"}},
 	})
@@ -42,10 +42,10 @@ func TestEnsureAllDBs_SkipsPureLocalGroups(t *testing.T) {
 		t.Fatalf("EnsureAllDBs() error = %v", err)
 	}
 
-	if got := dbURLs["auth-sessions.sessions"]; got != "" {
+	if got := dbInfo["auth-sessions.sessions"].URL; got != "" {
 		t.Fatalf("pure-local database URL = %q, want empty string", got)
 	}
-	if got := dbURLs["remote.core"]; got != "libsql://core.test" {
+	if got := dbInfo["remote.core"].URL; got != "libsql://core.test" {
 		t.Fatalf("remote database URL = %q, want libsql://core.test", got)
 	}
 	if groupCalls != 1 {
@@ -54,7 +54,7 @@ func TestEnsureAllDBs_SkipsPureLocalGroups(t *testing.T) {
 	if dbCalls != 1 {
 		t.Fatalf("database lookup calls = %d, want 1", dbCalls)
 	}
-	if _, ok := dbURLs["auth-sessions.sessions"]; !ok {
+	if _, ok := dbInfo["auth-sessions.sessions"]; !ok {
 		t.Fatalf("pure-local db key missing from result map")
 	}
 }
