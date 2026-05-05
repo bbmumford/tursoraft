@@ -42,6 +42,12 @@ type Database struct {
 	Group      string `json:"group"`
 	PrimaryURL string `json:"primary_url"`
 	Hostname   string `json:"hostname"`
+	// Version is the server version reported by the Platform API. Legacy sqld
+	// databases report values like "0.24.29"; new tursodb-backed databases
+	// report calendar versions like "2026.6.0". We use this to pick a
+	// compatible connector — tursogo's sync engine speaks only to the new
+	// platform.
+	Version string `json:"version"`
 }
 
 // Group represents a Turso group
