@@ -5,6 +5,8 @@ package connectors
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/url"
@@ -216,13 +218,22 @@ func MakeConnectorForServer(dbPath, primaryURL, serverVersion, authToken, encryp
 // "triggers" is always required because HSTLES schemas (e.g. core.sql's
 // trg_cleanup_empty_session) define SQL triggers; the embedded engine
 // refuses to open such databases without the flag.
-func buildLocalDSN(path, encryptionHexKey string) string {
+//
+// The caller may supply the encryption key as either hex or base64; the
+// HSTLES encryption.yaml stores keys base64-encoded but tursogo requires
+// hex on the encryption_hexkey parameter. We normalize transparently.
+func buildLocalDSN(path, encryptionKey string) string {
 	features := []string{"triggers"}
 	q := url.Values{}
-	if encryptionHexKey != "" {
-		features = append(features, "encryption")
-		q.Set("encryption_cipher", "aes256gcm")
-		q.Set("encryption_hexkey", encryptionHexKey)
+	if encryptionKey != "" {
+		hexKey, err := normalizeKeyToHex(encryptionKey)
+		if err != nil {
+			log.Printf("[tursoraft] WARNING: encryption key not usable (%v) — opening %s unencrypted", err, path)
+		} else {
+			features = append(features, "encryption")
+			q.Set("encryption_cipher", "aes256gcm")
+			q.Set("encryption_hexkey", hexKey)
+		}
 	}
 	q.Set("experimental", strings.Join(features, ","))
 	sep := "?"
@@ -230,4 +241,40 @@ func buildLocalDSN(path, encryptionHexKey string) string {
 		sep = "&"
 	}
 	return path + sep + q.Encode()
+}
+
+// normalizeKeyToHex returns the input as a hex-encoded string. It accepts
+// either hex (passed through verbatim) or standard/url-safe base64 (decoded
+// then hex-encoded). The legacy bbmumford/go-libsql connector accepted base64
+// directly via PRAGMA key — tursogo only supports hex on its DSN parameter.
+func normalizeKeyToHex(key string) (string, error) {
+	if isHex(key) {
+		return key, nil
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(key); err == nil {
+		return hex.EncodeToString(decoded), nil
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(key); err == nil {
+		return hex.EncodeToString(decoded), nil
+	}
+	if decoded, err := base64.URLEncoding.DecodeString(key); err == nil {
+		return hex.EncodeToString(decoded), nil
+	}
+	return "", fmt.Errorf("not hex or base64")
+}
+
+func isHex(s string) bool {
+	if len(s) == 0 || len(s)%2 != 0 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
