@@ -130,6 +130,10 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 		Path:      dbPath,
 		RemoteUrl: primaryURL,
 		AuthToken: authToken,
+		// HSTLES schemas use SQL triggers (e.g. trg_cleanup_empty_session
+		// in core.sql); the embedded Turso engine refuses to open such
+		// databases unless this experimental feature is enabled.
+		ExperimentalFeatures: "triggers",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create embedded sync db: %w", err)
@@ -163,19 +167,23 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 	return handle, nil
 }
 
-// buildLocalDSN appends DSN-style encryption options to a local file path
-// when an encryption key is provided. tursogo accepts these query
-// parameters on sql.Open("turso", …):
+// buildLocalDSN appends DSN-style options to a local file path. tursogo
+// accepts a comma-separated experimental= list plus encryption options:
 //
-//	?experimental=encryption&encryption_cipher=aes256gcm&encryption_hexkey=<hex>
+//	?experimental=triggers,encryption&encryption_cipher=aes256gcm&encryption_hexkey=<hex>
+//
+// "triggers" is always required because HSTLES schemas (e.g. core.sql's
+// trg_cleanup_empty_session) define SQL triggers; the embedded engine
+// refuses to open such databases without the flag.
 func buildLocalDSN(path, encryptionHexKey string) string {
-	if encryptionHexKey == "" {
-		return path
-	}
+	features := []string{"triggers"}
 	q := url.Values{}
-	q.Set("experimental", "encryption")
-	q.Set("encryption_cipher", "aes256gcm")
-	q.Set("encryption_hexkey", encryptionHexKey)
+	if encryptionHexKey != "" {
+		features = append(features, "encryption")
+		q.Set("encryption_cipher", "aes256gcm")
+		q.Set("encryption_hexkey", encryptionHexKey)
+	}
+	q.Set("experimental", strings.Join(features, ","))
 	sep := "?"
 	if strings.Contains(path, "?") {
 		sep = "&"
