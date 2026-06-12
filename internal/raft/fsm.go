@@ -18,7 +18,7 @@ import (
 // LogEntry represents a database operation to be replicated across the Raft cluster
 type LogEntry struct {
 	Group  string   `json:"group"`   // Turso group name
-	DBName string   `json:"db_name"` // Database name within the group
+	DBName string   `json:"dbName"` // Database name within the group
 	SQL    string   `json:"sql"`     // SQL statement to execute
 	Args   [][]byte `json:"args"`    // Serialized arguments for the SQL statement
 	WAL    []byte   `json:"wal"`     // WAL frames (for future use)

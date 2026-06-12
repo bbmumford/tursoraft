@@ -13,9 +13,9 @@ import (
 
 // RaftConfig represents Raft consensus configuration (local copy to avoid import cycle).
 type RaftConfig struct {
-	RaftBindAddr string `json:"raft_bind_addr"`
-	LocalDir     string `json:"local_dir"`
-	SnapshotDir  string `json:"snapshot_dir"`
+	RaftBindAddr string `json:"raftBindAddr"`
+	LocalDir     string `json:"localDir"`
+	SnapshotDir  string `json:"snapshotDir"`
 }
 
 // ResolveAdvertiseAddress converts a bind address into a routable Raft advertise

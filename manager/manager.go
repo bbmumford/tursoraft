@@ -39,9 +39,9 @@ import (
 //   - API docs: https://docs.turso.tech/api-reference/
 //   - Authentication: https://docs.turso.tech/api-reference/authentication
 type TursoConfig struct {
-	APIToken string `json:"api_token"` // Platform API token (for management, not queries)
-	OrgName  string `json:"org_name"`  // Organization name (e.g., "hstles")
-	BaseURL  string `json:"base_url"`  // Optional: override API base URL (default: https://api.turso.tech)
+	APIToken string `json:"apiToken"` // Platform API token (for management, not queries)
+	OrgName  string `json:"orgName"`  // Organization name (e.g., "hstles")
+	BaseURL  string `json:"baseUrl"`  // Optional: override API base URL (default: https://api.turso.tech)
 }
 
 // GroupConfig represents configuration for a single Turso database group.
@@ -58,11 +58,11 @@ type TursoConfig struct {
 //	turso group show <group>      # Show group details
 //	turso db list                 # See which databases are in which groups
 type GroupConfig struct {
-	GroupName     string   `json:"group_name"`     // Group name from Turso (e.g., "hstles")
-	AuthToken     string   `json:"auth_token"`     // Auth token for query execution (db-level access)
-	DBNames       []string `json:"db_names"`       // Database names within this group (e.g., ["core", "files"])
-	EncryptionKey string   `json:"encryption_key"` // Optional: encryption key for local replica (data-at-rest)
-	PureLocal     bool     `json:"pure_local"`     // If true, force pure local mode (no Turso sync) regardless of UseEmbedded flag
+	GroupName     string   `json:"groupName"`     // Group name from Turso (e.g., "hstles")
+	AuthToken     string   `json:"authToken"`     // Auth token for query execution (db-level access)
+	DBNames       []string `json:"dbNames"`       // Database names within this group (e.g., ["core", "files"])
+	EncryptionKey string   `json:"encryptionKey"` // Optional: encryption key for local replica (data-at-rest)
+	PureLocal     bool     `json:"pureLocal"`     // If true, force pure local mode (no Turso sync) regardless of UseEmbedded flag
 }
 
 // RaftConfig represents Raft consensus configuration.
@@ -82,9 +82,9 @@ type GroupConfig struct {
 //   - Typically use internal/private network addresses
 //   - For production, consider ":443" to avoid firewall issues
 type RaftConfig struct {
-	RaftBindAddr string `json:"raft_bind_addr"` // Address to bind Raft transport (e.g., ":7000", ":443")
-	LocalDir     string `json:"local_dir"`      // Directory for Raft logs and local SQLite replicas
-	SnapshotDir  string `json:"snapshot_dir"`   // Directory for Raft snapshots
+	RaftBindAddr string `json:"raftBindAddr"` // Address to bind Raft transport (e.g., ":7000", ":443")
+	LocalDir     string `json:"localDir"`      // Directory for Raft logs and local SQLite replicas
+	SnapshotDir  string `json:"snapshotDir"`   // Directory for Raft snapshots
 }
 
 // ManagerConfig holds the complete configuration for the MeshDB manager.
@@ -114,13 +114,13 @@ type RaftConfig struct {
 //	    SyncInterval: 5 * time.Minute,
 //	}
 type ManagerConfig struct {
-	TursoConfig  TursoConfig   `json:"turso_config"`  // Turso Platform API settings
-	RaftConfig   RaftConfig    `json:"raft_config"`   // Raft consensus settings
+	TursoConfig  TursoConfig   `json:"tursoConfig"`  // Turso Platform API settings
+	RaftConfig   RaftConfig    `json:"raftConfig"`   // Raft consensus settings
 	Groups       []GroupConfig `json:"groups"`        // Database groups to manage
-	PeerEnvVar   string        `json:"peer_env_var"`  // Environment variable containing peer addresses
-	SyncInterval time.Duration `json:"sync_interval"` // How often to sync from Turso (leader only)
-	SnapMinGap   time.Duration `json:"snap_min_gap"`  // Minimum gap between snapshots after successful pull
-	UseEmbedded  bool          `json:"use_embedded"`  // If true, use go-libsql embedded for local DBs (Turso optional)
+	PeerEnvVar   string        `json:"peerEnvVar"`  // Environment variable containing peer addresses
+	SyncInterval time.Duration `json:"syncInterval"` // How often to sync from Turso (leader only)
+	SnapMinGap   time.Duration `json:"snapMinGap"`  // Minimum gap between snapshots after successful pull
+	UseEmbedded  bool          `json:"useEmbedded"`  // If true, use go-libsql embedded for local DBs (Turso optional)
 }
 
 // DefaultManagerConfig returns a configuration with sensible defaults.

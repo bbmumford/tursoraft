@@ -11,9 +11,9 @@ import (
 
 // TursoConfig represents Turso Platform API configuration (local copy to avoid import cycle).
 type TursoConfig struct {
-	APIToken string `json:"api_token"`
-	OrgName  string `json:"org_name"`
-	BaseURL  string `json:"base_url"`
+	APIToken string `json:"apiToken"`
+	OrgName  string `json:"orgName"`
+	BaseURL  string `json:"baseUrl"`
 }
 
 // TursoClient provides methods to interact with the Turso Platform API
