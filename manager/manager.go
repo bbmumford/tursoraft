@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/raft"
 
 	"github.com/bbmumford/tursoraft/connectors"
+	"github.com/bbmumford/tursoraft/database"
 	raftpkg "github.com/bbmumford/tursoraft/internal/raft"
 	"github.com/bbmumford/tursoraft/internal/turso"
 )
@@ -894,6 +895,34 @@ func (m *Manager) Database(group, dbName string) (*sql.DB, error) {
 		return nil, fmt.Errorf("database %s not found", dbKey)
 	}
 	return db, nil
+}
+
+// SyncStats reports how far one database's local replica has diverged from its
+// primary: writes made locally since the last pull, the last pull and push
+// times, and the server revision.
+//
+// Database returns the *sql.DB and drops the handle the embedded connector
+// recorded that state on, so a caller holding this manager can reach the
+// connection but not the replica's standing. This exposes the reading alone —
+// enough to answer whether local writes are accumulating unsent, without handing
+// out a handle whose other methods can close or re-sync the database.
+//
+// It reports an error rather than a zero reading in every case it cannot
+// answer: a manager that is not running, a database it does not hold, or a
+// handle carrying no stats function (database.ErrSyncStatsUnavailable, passed
+// through unwrapped). Zero pending writes is the HEALTHY reading, so a caller
+// that treated an error as zero would read an unmeasurable replica as a
+// fully-synced one — which is the confusion this whole reading exists to
+// prevent.
+func (m *Manager) SyncStats(ctx context.Context, group, dbName string) (database.SyncStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if !m.isRunning {
+		return database.SyncStats{}, fmt.Errorf("manager is not running")
+	}
+
+	return m.connectorManager.SyncStats(ctx, fmt.Sprintf("%s.%s", group, dbName))
 }
 
 // AddPeer adds a new peer to the Raft cluster.
