@@ -190,8 +190,20 @@ func MakeConnectorForServer(dbPath, primaryURL, serverVersion, authToken, encryp
 
 	// handle.WithSync replaces go-libsql's WithSyncInterval — Raft drives
 	// the sync cadence here, so caller-driven Pull is the correct shape.
-	// Push isn't needed: writes flow through the regular *sql.DB and are
-	// committed remotely by tursogo's normal write path.
+	//
+	// ⚠ PULL DOES NOT SEND LOCAL WRITES. tursogo documents Pull as rebasing
+	// local changes on top of remote ones, and Push as the only call that
+	// sends them; its stats account for network traffic during Push and Pull
+	// alone, and count writes as local operations pending since the last
+	// pull. Nothing here calls Push, so a write made through this handle
+	// stays in the local replica.
+	//
+	// Whether this connector should push, and on whose cadence, is a
+	// consensus-model decision and is deliberately not made here. What IS
+	// done here is make the divergence readable: WithSyncStats below exposes
+	// the counters, so a caller can see pending writes accumulating and a
+	// LastPushUnixTime that never leaves 0, instead of inferring either from
+	// this comment.
 	handle.WithSync(func(ctx context.Context) error {
 		if ctx == nil {
 			ctx = context.Background()
@@ -203,6 +215,25 @@ func MakeConnectorForServer(dbPath, primaryURL, serverVersion, authToken, encryp
 		}
 		_, err := syncDb.Pull(ctx)
 		return err
+	})
+	// Map the driver's stats into the neutral shape so the database package
+	// keeps no driver dependency. Only the fields a caller needs to judge
+	// divergence are carried; the WAL sizes and byte counters stay behind
+	// tursogo's own API for anyone who wants them.
+	handle.WithSyncStats(func(ctx context.Context) (database.SyncStats, error) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		s, err := syncDb.Stats(ctx)
+		if err != nil {
+			return database.SyncStats{}, err
+		}
+		return database.SyncStats{
+			PendingLocalWrites: s.CdcOperations,
+			LastPullUnixTime:   s.LastPullUnixTime,
+			LastPushUnixTime:   s.LastPushUnixTime,
+			Revision:           s.Revision,
+		}, nil
 	})
 	// tursogo's TursoSyncDb does not (yet) expose a Close method;
 	// closing the *sql.DB returned by Connect releases all resources we
