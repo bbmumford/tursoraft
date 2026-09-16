@@ -142,6 +142,30 @@ func (cm *ConnectorManager) GetDatabase(dbKey string) (*sql.DB, bool) {
 	return handle.Database(), true
 }
 
+// SyncStats reports how far one database's local replica has diverged from its
+// primary, for a caller holding only this manager.
+//
+// GetDatabase hands out the handle's *sql.DB and drops the handle, so a consumer
+// outside this package can reach the connection but not the replica state the
+// embedded connector recorded on it. This returns the reading rather than the
+// handle: divergence is observable without also exposing Close, the raw
+// connector, or anything else a holder of the handle could do to it.
+//
+// An unknown dbKey is an error, never a zero SyncStats with a nil error. Zero
+// pending writes is the HEALTHY reading, so answering that way for a database
+// this manager has never heard of would let a caller read a name typo as a
+// synced replica. A handle with no stats function reports
+// database.ErrSyncStatsUnavailable, which is passed through unwrapped so the
+// caller can tell "cannot measure" from "measured zero" — the distinction the
+// handle refuses to collapse.
+func (cm *ConnectorManager) SyncStats(ctx context.Context, dbKey string) (database.SyncStats, error) {
+	handle, exists := cm.connectors[dbKey]
+	if !exists {
+		return database.SyncStats{}, fmt.Errorf("database %s not found", dbKey)
+	}
+	return handle.Stats(ctx)
+}
+
 // GetAllKeys returns all database keys managed by the connector.
 //
 // Purpose: Enumerate all registered databases for iteration or monitoring.
