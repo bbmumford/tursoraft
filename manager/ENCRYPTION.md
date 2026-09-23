@@ -60,6 +60,7 @@ derived at start and never stored.
 
 ## Keys outside a Manager
 
-`connectors.MakeConnector` given no key opens a local file in plaintext,
-because loom's node runtime opens its LAD file that way. Given a key it opens
-the file encrypted, and given a primary URL it requires one.
+`connectors.MakeConnector` requires a key as well: an empty one is
+`connectors.ErrNoKey`, and one that is not base64 of 32 bytes
+`connectors.ErrBadKey`, both before any file is created. Given a primary URL
+it opens an encrypted replica, else an encrypted local file.

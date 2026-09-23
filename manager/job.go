@@ -70,3 +70,14 @@ func (m *Manager) Leader(group, db string) (string, error) {
 	}
 	return c.Leader(), nil
 }
+
+// MeshKey is the key the Raft cluster of a group's shared database runs under
+// on the mesh: its members publish their metadata under it, and every Raft
+// stream is dialled and listened for on it.
+//
+// Consumed by a mesh runtime that admits a cluster's streams by key, such as
+// loom's node runtime, which accepts an inbound stream only when its key
+// belongs to a raft block giving the dialling service a seat. A key that
+// differs from the one the cluster uses matches no stream and admits nobody,
+// so the runtime takes it from here rather than restating its form.
+func MeshKey(group, db string) string { return cluster.Key(group, db) }

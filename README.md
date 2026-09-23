@@ -30,13 +30,23 @@ boot.
 | `localdb` | One encrypted tursogo file through policypool |
 | `fence` | `Fence.Tx`: epoch-fenced write transactions |
 | `mesh`, `mesh/meshtest` | The transport contract Raft runs over, and test meshes |
-| `connectors` | `MakeConnector`, one handle outside a Manager |
+| `connectors` | `MakeConnector`, one encrypted handle outside a Manager |
 | `database` | `DatabaseHandle` and `SyncStats` |
+| `sqldtest` | Starts a local sqld for a test that needs a primary |
 | `cmd/tursoraft-admin` | Operator tool: `ensure`, `token`, `fence-adopt` |
 
-Every `*sql.DB` tursoraft returns comes from `policypool` with
-`ForeignKeysRequired`: every connection proves `foreign_keys=1` when it opens
-and on every reuse, and a statement that would turn it off is refused.
+Every `*sql.DB` tursoraft returns comes from `policypool`, and on every
+connection a statement that would turn foreign keys off is refused.
+
+- A **local file's** pool (`ForeignKeysRequired`) proves `foreign_keys=1` when
+  each connection opens and again on every reuse: tursogo opens every
+  connection with it off.
+- A **replica's** pool (`ForeignKeysRequiredAtConnect`) proves it only when each
+  connection opens. go-libsql sends that proof to the primary, so a proof on
+  every reuse would cost each statement a round trip and fail every read while
+  the primary is down. The setting cannot lapse in between: the libSQL primary
+  starts every session with it on, and the guard refuses the only statement
+  that turns it off.
 
 ## Configuration
 
@@ -93,8 +103,9 @@ kinds ever share a path:
 3. Open the replica (`WithEncryption`, `WithReadYourWrites`, `WithRawText`,
    `WithImmediateTransactions`), retrying an unreachable primary for the open
    timeout (60 s), then fail. There is no fallback.
-4. Wrap it with `policypool.OpenConnector(…, ForeignKeysRequired)` and start
-   its sync loop (every sync interval, default 5 s, jittered ±20%).
+4. Wrap it with `policypool.OpenConnector(…, ForeignKeysRequiredAtConnect)`,
+   keeping up to `replica.PoolSize` (8) proved connections idle, and start its
+   sync loop (every sync interval, default 5 s, jittered ±20%).
 5. Open local databases through tursogo, encrypted, through policypool.
 6. `Database()` works from here and never waits for Raft.
 7. Start each Raft cluster this process has a seat in.
@@ -158,11 +169,12 @@ Shared groups need cgo (go-libsql is a C library). go-libsql and policypool
 resolve through `replace` directives to sibling checkouts; workspaces that
 use tursoraft carry the same lines in their `go.work`.
 
-Tests that need a primary start a local sqld on 127.0.0.1 and a free port
-and stop only the process they started. The binary is `$TURSORAFT_SQLD`, else
-`/opt/homebrew/bin/sqld`, else `sqld` on `PATH`; with none they skip. Tests
-that hold `BEGIN IMMEDIATE` on two replicas at once need sqld 0.24 or later
-and skip on older ones, which never answer the second replica.
+Tests that need a primary start a local sqld through `sqldtest`, on
+127.0.0.1 and a free port, and stop only the process they started. The binary
+is `$TURSORAFT_SQLD`, else `/opt/homebrew/bin/sqld`, else `sqld` on `PATH`;
+with none they skip. Tests that hold `BEGIN IMMEDIATE` on two replicas at once
+need sqld 0.24 or later and skip on older ones, which never answer the second
+replica.
 
 ```
 TURSORAFT_SQLD=/path/to/sqld-0.24 go test -race -count=1 -p 2 ./...
@@ -170,11 +182,11 @@ TURSORAFT_SQLD=/path/to/sqld-0.24 go test -race -count=1 -p 2 ./...
 
 ## Known limits
 
-- **Every pooled statement reaches the primary.** policypool proves foreign
-  keys on each connection reuse, and go-libsql sends `PRAGMA foreign_keys` to
-  the primary. A pooled read therefore costs a round trip (2.5 ms against
-  0.03 ms for the engine's own read on loopback) and fails while the primary
-  is down, though the replica file could answer it.
+- **Reads during an outage run on connections proved before it.** A new
+  connection's foreign-key proof needs the primary. While the primary is down
+  a replica serves reads from its file on the connections its pool already
+  holds, up to `replica.PoolSize` at once; a read that needs one more fails,
+  and every write fails.
 - **Replica key strength.** go-libsql takes the key as the base64 passphrase
   and its cipher uses the passphrase's first 32 bytes, so the first 24 bytes
   (192 bits) of the group key protect a replica file.

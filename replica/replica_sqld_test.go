@@ -6,16 +6,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/bbmumford/tursoraft/internal/sqldtest"
 	"github.com/bbmumford/tursoraft/localdb"
 	"github.com/bbmumford/tursoraft/replica"
+	"github.com/bbmumford/tursoraft/sqldtest"
 )
 
 func newKey(t *testing.T) []byte {
@@ -262,11 +265,107 @@ func TestOutageWritesFailAndRecover(t *testing.T) {
 	}
 }
 
-// Reads through the pool during an outage. The replica file itself answers a
-// SELECT with the primary down, but policypool proves foreign keys on every
-// new connection and again on every reuse, and the replica engine sends
-// PRAGMA foreign_keys to the primary; so every pooled statement needs the
-// primary. TestPolicyProofReachesThePrimary measures it.
+// While the primary is down, reads through the pool keep answering from the
+// replica file: every 100 ms, PoolSize connections proved before the outage
+// each serve a read at once, and each read sees every row. Writes fail
+// meanwhile, and a failed write costs the pool no proved connection. Once the
+// primary is back a write succeeds and a later read sees it, and a write that
+// would orphan a row is refused, though no connection proved foreign keys
+// again on the primary's new session.
 func TestOutageServesReads(t *testing.T) {
-	t.Skip("pooled reads need the primary: policypool's per-reuse foreign-key proof is delegated to it (see TestPolicyProofReachesThePrimary)")
+	s := sqldtest.Start(t)
+	r := openReplica(t, s, filepath.Join(t.TempDir(), "reads.db"), newKey(t))
+	mustExec(t, r, "CREATE TABLE p(id INTEGER PRIMARY KEY)")
+	mustExec(t, r, "CREATE TABLE c(id INTEGER PRIMARY KEY, p INTEGER NOT NULL REFERENCES p(id))")
+	mustExec(t, r, "INSERT INTO p VALUES (1), (2), (3)")
+	ctx := context.Background()
+	db := r.DB()
+
+	// hold takes PoolSize connections at once. During the outage a connection
+	// the pool has to open fails its proof, so this succeeds only while every
+	// connection proved before the outage is still in the pool.
+	hold := func() []*sql.Conn {
+		t.Helper()
+		conns := make([]*sql.Conn, replica.PoolSize)
+		for i := range conns {
+			c, err := db.Conn(ctx)
+			if err != nil {
+				for _, held := range conns[:i] {
+					held.Close()
+				}
+				t.Fatalf("connection %d of %d: %v", i+1, len(conns), err)
+			}
+			conns[i] = c
+		}
+		return conns
+	}
+	release := func(conns []*sql.Conn) {
+		for _, c := range conns {
+			c.Close()
+		}
+	}
+	release(hold())
+	if idle := db.Stats().Idle; idle != replica.PoolSize {
+		t.Fatalf("setup: the pool keeps %d proved connections idle, want %d", idle, replica.PoolSize)
+	}
+
+	s.Stop()
+	outage := 30 * time.Second
+	if testing.Short() {
+		outage = 3 * time.Second
+	}
+	reads, writes := 0, 0
+	for deadline, tick := time.Now().Add(outage), 0; time.Now().Before(deadline); tick++ {
+		conns := hold()
+		errs := make(chan error, len(conns))
+		var wg sync.WaitGroup
+		for _, c := range conns {
+			wg.Add(1)
+			go func(c *sql.Conn) {
+				defer wg.Done()
+				var n int
+				if err := c.QueryRowContext(ctx, "SELECT count(*) FROM p").Scan(&n); err != nil {
+					errs <- err
+				} else if n != 3 {
+					errs <- fmt.Errorf("read %d rows, want 3", n)
+				}
+			}(c)
+		}
+		wg.Wait()
+		release(conns)
+		close(errs)
+		for err := range errs {
+			t.Fatalf("a read after %d served reads of the outage: %v", reads, err)
+		}
+		reads += len(conns)
+		if tick%10 == 0 {
+			if _, err := db.ExecContext(ctx, "INSERT INTO p VALUES (4)"); err == nil {
+				t.Fatal("a write succeeded with the primary down")
+			}
+			writes++
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Logf("outage of %v: %d reads served, %d writes refused", outage, reads, writes)
+
+	s.Restart()
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		_, err := db.ExecContext(rctx, "INSERT INTO p VALUES (4)")
+		if err == nil {
+			break
+		}
+		if rctx.Err() != nil {
+			t.Fatalf("writes did not recover: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if n := count(t, r, "p"); n != 4 {
+		t.Errorf("after recovery the replica reads %d rows, want 4", n)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO c VALUES (1, 99)"); err == nil {
+		t.Error("an orphan row was written after the primary restarted: its new session does not enforce foreign keys")
+	}
+	mustExec(t, r, "INSERT INTO c VALUES (1, 4)")
 }
