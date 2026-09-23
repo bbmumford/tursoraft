@@ -6,9 +6,8 @@ package manager
 // false.
 //
 // Deprecated: register the work as a Job and gate it on Job.Held, whose
-// writes are fenced. IsLeader exists because fleet.orbtr.ai, api.orbtr.ai and
-// node.orbtr.io gate background writers on it, and fleet passes it as a
-// func() bool value.
+// writes are fenced. IsLeader exists because fleet.orbtr.ai and node.orbtr.io
+// gate background writers on it, and fleet passes it as a func() bool value.
 func (m *Manager) IsLeader() bool {
 	m.mu.Lock()
 	declared, first := m.declared, m.first
