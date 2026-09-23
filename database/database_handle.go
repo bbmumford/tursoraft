@@ -7,40 +7,34 @@ import (
 )
 
 // ErrSyncStatsUnavailable is what Stats returns when no stats function is set,
-// which is every handle that is not an embedded replica: a pure-local database
-// and a direct-to-primary connection have no local-versus-remote divergence to
-// report.
+// which is every handle that is not an embedded replica: a local file has no
+// primary to fall behind.
 //
 // It is a distinct error rather than a zero SyncStats because the two mean
-// opposite things to a caller deciding whether a replica is healthy. Zero
-// PendingLocalWrites is the GOOD state — everything written here has been sent.
-// No stats at all is the UNKNOWN state. Returning the zero value for both would
-// let a health check read an unmeasurable handle as a fully-synced one.
+// opposite things to a caller deciding whether a replica is healthy: zero
+// figures from a replica are a reading, no stats at all is the unknown state.
 var ErrSyncStatsUnavailable = errors.New("tursoraft: sync stats are not available on this handle")
 
-// SyncStats reports how far an embedded replica's local database has diverged
-// from its remote, in the terms the sync driver keeps.
+// SyncStats reports how far an embedded replica is behind its primary.
 //
-// The fields carry the driver's own meanings. PendingLocalWrites counts local
-// operations written since the last pull, so it grows as writes land and falls
-// when they are sent onward; LastPushUnixTime stays 0 until a push has ever
-// succeeded. A handle whose writes are never sent therefore reports a
-// LastPushUnixTime of 0 and a PendingLocalWrites that only climbs — the pair a
-// caller reads to tell a replica that is keeping up from one that is quietly
-// accumulating.
+// A replica sends every write to the primary before the write returns, so
+// nothing waits locally to be sent: PendingLocalWrites and LastPushUnixTime
+// are always 0. LastPullUnixTime is the last time the replica pulled from the
+// primary successfully, and Revision is the replica's frame number after that
+// pull, in decimal.
 //
-// It is a neutral struct rather than the driver's own so this package keeps no
-// driver dependency and the non-embedded build keeps its current import set;
-// the connector that has the driver maps one into the other.
+// The four fields keep the shape node.orbtr.io's control-database log line
+// reads.
 type SyncStats struct {
-	// PendingLocalWrites is the count of local operations written since the
-	// last pull.
+	// PendingLocalWrites is always 0 for a replica: writes are forwarded to the
+	// primary before they return.
 	PendingLocalWrites int64
 	// LastPullUnixTime is the time of the last successful pull, 0 if never.
 	LastPullUnixTime int64
-	// LastPushUnixTime is the time of the last successful push, 0 if never.
+	// LastPushUnixTime is always 0 for a replica: nothing is pushed.
 	LastPushUnixTime int64
-	// Revision is the opaque server revision. Report it; never parse it.
+	// Revision is the replica's frame number after the last pull. Report it;
+	// never parse it.
 	Revision string
 }
 
@@ -64,7 +58,7 @@ func (h *DatabaseHandle) WithSync(sync func(context.Context) error) {
 }
 
 // WithSyncStats sets the function that reports this handle's replica divergence.
-// Only a connector holding an embedded sync database sets it; the rest leave it
+// Only a handle holding an embedded replica sets it; the rest leave it
 // nil and Stats reports ErrSyncStatsUnavailable rather than a healthy-looking
 // zero.
 func (h *DatabaseHandle) WithSyncStats(stats func(context.Context) (SyncStats, error)) {
@@ -121,16 +115,20 @@ func (h *DatabaseHandle) Sync(ctx context.Context) error {
 	return h.syncFunc(ctx)
 }
 
-// Close closes the database and runs cleanup functions
+// Close runs the cleanup functions, in the order they were added, and then
+// closes the pool.
+//
+// The cleanup functions run first because a replica's sync loop drives the
+// connector the pool owns, and must stop before the pool closes it.
 func (h *DatabaseHandle) Close() error {
 	var errs []error
-	if h.db != nil {
-		if err := h.db.Close(); err != nil {
+	for _, fn := range h.closeFuncs {
+		if err := fn(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	for _, fn := range h.closeFuncs {
-		if err := fn(); err != nil {
+	if h.db != nil {
+		if err := h.db.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

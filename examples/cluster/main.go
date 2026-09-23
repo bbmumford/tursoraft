@@ -1,134 +1,103 @@
-// Example: Multi-node TursoRaft cluster with high availability
+// Command cluster runs one member of a Raft cluster that decides which
+// process runs a singleton job, and runs that job's writes through the fence.
 //
-// This demonstrates configuring a multi-node cluster for production
-// environments with proper peer discovery and failover.
+// Start three members on one machine, each in its own terminal:
+//
+//	for id in n1 n2 n3; do
+//	  TURSORAFT_URL=http://127.0.0.1:8080 TURSORAFT_TOKEN=local \
+//	  TURSORAFT_KEY=<the same base64 32-byte key> \
+//	  go run ./examples/cluster -id $id &
+//	done
+//
+// The members find each other through meshtest's loopback mesh, a stand-in
+// for the mesh runtime a deployment passes in ManagerConfig.Mesh. Kill the
+// member printing "holding" and another takes the job over.
 package main
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
+	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
-	"syscall"
+	"path/filepath"
 	"time"
 
+	"github.com/bbmumford/tursoraft/fence"
 	"github.com/bbmumford/tursoraft/manager"
+	"github.com/bbmumford/tursoraft/mesh/meshtest"
 )
 
 func main() {
-	nodeID := os.Getenv("NODE_ID")
-	if nodeID == "" {
-		nodeID = "node-1"
-	}
-
-	// Production-ready configuration
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: os.Getenv("TURSO_API_TOKEN"),
-			OrgName:  os.Getenv("TURSO_ORG_NAME"),
-		},
-		Groups: []manager.GroupConfig{
-			{
-				GroupName: "production",
-				AuthToken: os.Getenv("TURSO_DB_TOKEN"),
-				DBNames:   []string{"app-data", "user-sessions", "audit-logs"},
-			},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     fmt.Sprintf("./data/raft/%s", nodeID),
-			SnapshotDir:  fmt.Sprintf("./data/raft/%s/snapshots", nodeID),
-			RaftBindAddr: getEnvOrDefault("RAFT_BIND_ADDR", ":8300"),
-		},
-		// Peer discovery via environment variable
-		// Format: "node-1=10.0.0.1:8300,node-2=10.0.0.2:8300,node-3=10.0.0.3:8300"
-		PeerEnvVar: "TURSORAFT_PEERS",
-
-		// Background sync settings
-		SyncInterval: 5 * time.Minute,
-		SnapMinGap:   2 * time.Minute,
-	}
-
-	// Validate
-	if err := cfg.Validate(); err != nil {
-		log.Fatalf("config validation failed: %v", err)
-	}
-
-	// Create manager
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	mgr, err := manager.NewManager(ctx, cfg)
+	id := flag.String("id", "n1", "this member's node id")
+	flag.Parse()
+	root, err := filepath.Abs("tursoraft-cluster-example")
 	if err != nil {
-		log.Fatalf("failed to create manager: %v", err)
+		log.Fatal(err)
 	}
-
-	// Start health/status HTTP server
-	go startStatusServer(mgr, nodeID, ":8080")
-
-	// Wait for shutdown signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	<-sigCh
-	log.Println("Shutting down...")
-
-	// Graceful shutdown
-	if err := mgr.Shutdown(); err != nil {
-		log.Printf("shutdown error: %v", err)
+	os.MkdirAll(filepath.Join(root, "mesh"), 0o700)
+	mesh, err := meshtest.NewLoopback(filepath.Join(root, "mesh"), *id, "node.orbtr.ai")
+	if err != nil {
+		log.Fatal(err)
 	}
-}
+	defer mesh.Close()
 
-func startStatusServer(mgr *manager.Manager, nodeID, addr string) {
-	mux := http.NewServeMux()
-
-	// Health check endpoint
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+	vol := filepath.Join(root, *id)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	mgr, err := manager.NewManager(ctx, manager.ManagerConfig{
+		Groups: []manager.GroupConfig{{
+			GroupName:     "control",
+			DBNames:       []string{"orbtr-control"},
+			EncryptionKey: os.Getenv("TURSORAFT_KEY"),
+			Databases: []manager.DatabaseConfig{{
+				Name: "orbtr-control", URL: os.Getenv("TURSORAFT_URL"), AuthToken: os.Getenv("TURSORAFT_TOKEN"),
+			}},
+			Raft: &manager.RaftSpec{
+				VoterServices:   []string{"node.orbtr.ai"},
+				VoterCount:      3,
+				BootstrapExpect: 3,
+				Jobs:            map[string][]string{"projector": {"node.orbtr.ai"}},
+			},
+		}},
+		RaftConfig: manager.RaftConfig{LocalDir: filepath.Join(vol, "tursoraft")},
+		VolumeDir:  vol,
+		Mesh:       mesh,
 	})
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	defer mgr.Shutdown()
 
-	// Cluster status endpoint
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		leaderAddr, _ := mgr.GetLeader()
-		peers, _ := mgr.GetPeers()
-
-		status := map[string]interface{}{
-			"is_leader": mgr.IsLeader(),
-			"node_id":   nodeID,
-			"leader":    leaderAddr,
-			"peers":     peers,
-			"timestamp": time.Now().UTC(),
+	db, err := mgr.Database("control", "orbtr-control")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS projected(id INTEGER PRIMARY KEY, node TEXT, epoch INTEGER)`); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := mgr.Job("control", "orbtr-control", "projector", func(ctx context.Context, f fence.Fence) error {
+		fmt.Printf("%s holding projector at epoch %d\n", *id, f.Epoch)
+		for {
+			// Every write of the job goes through the fence: a holder that
+			// lost the job fails here with fence.ErrFenced.
+			err := f.Tx(ctx, db, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `INSERT INTO projected(node, epoch) VALUES (?, ?)`, *id, int64(f.Epoch))
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Second):
+			}
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(status)
-	})
-
-	// Ready check - simple health for now
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		// Check if we can reach leader (indicates cluster is operational)
-		_, err := mgr.GetLeader()
-		if err == nil {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ready"))
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("not ready"))
-		}
-	})
-
-	log.Printf("Status server listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Printf("status server error: %v", err)
+	}); err != nil {
+		log.Fatal(err)
 	}
-}
-
-func getEnvOrDefault(key, defaultValue string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultValue
+	<-ctx.Done()
 }

@@ -1,254 +1,98 @@
-package manager_test
+package manager
 
 import (
+	"context"
+	"errors"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/bbmumford/tursoraft/manager"
+	"go.uber.org/goleak"
+
+	"github.com/bbmumford/tursoraft/database"
 )
 
-func TestDefaultManagerConfig(t *testing.T) {
-	cfg := manager.DefaultManagerConfig()
-
-	if cfg.RaftConfig.LocalDir != "./meshdb_data" {
-		t.Errorf("expected LocalDir './meshdb_data', got '%s'", cfg.RaftConfig.LocalDir)
-	}
-	if cfg.RaftConfig.SnapshotDir != "./meshdb_snapshots" {
-		t.Errorf("expected SnapshotDir './meshdb_snapshots', got '%s'", cfg.RaftConfig.SnapshotDir)
-	}
-	if cfg.RaftConfig.RaftBindAddr != ":8300" {
-		t.Errorf("expected RaftBindAddr ':8300', got '%s'", cfg.RaftConfig.RaftBindAddr)
-	}
-	if cfg.PeerEnvVar != "MESHDB_PEERS" {
-		t.Errorf("expected PeerEnvVar 'MESHDB_PEERS', got '%s'", cfg.PeerEnvVar)
-	}
-	if cfg.SyncInterval != 6*time.Hour {
-		t.Errorf("expected SyncInterval 6h, got %v", cfg.SyncInterval)
-	}
-	if cfg.SnapMinGap != 2*time.Minute {
-		t.Errorf("expected SnapMinGap 2m, got %v", cfg.SnapMinGap)
-	}
-	if cfg.UseEmbedded {
-		t.Error("expected UseEmbedded to be false by default")
-	}
-}
-
-func TestManagerConfigValidate_MissingAPIToken(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			OrgName: "test-org",
-			// APIToken missing
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "test", AuthToken: "token", DBNames: []string{"db1"}},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-		UseEmbedded: false, // Non-embedded requires API token
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected validation error for missing API token")
-	}
-}
-
-func TestManagerConfigValidate_MissingOrgName(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			// OrgName missing
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "test", AuthToken: "token", DBNames: []string{"db1"}},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-		UseEmbedded: false,
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected validation error for missing org name")
-	}
-}
-
-func TestManagerConfigValidate_EmptyGroups(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			OrgName:  "test-org",
-		},
-		Groups: []manager.GroupConfig{}, // Empty
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected validation error for empty groups")
-	}
-}
-
-func TestManagerConfigValidate_MissingGroupName(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			OrgName:  "test-org",
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "", AuthToken: "token", DBNames: []string{"db1"}},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected validation error for missing group name")
-	}
-}
-
-func TestManagerConfigValidate_MissingAuthToken(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			OrgName:  "test-org",
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "test", AuthToken: "", DBNames: []string{"db1"}},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-		UseEmbedded: false,
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected validation error for missing auth token")
-	}
-}
-
-func TestManagerConfigValidate_EmptyDBNames(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			OrgName:  "test-org",
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "test", AuthToken: "token", DBNames: []string{}},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected validation error for empty DB names")
-	}
-}
-
-func TestManagerConfigValidate_MissingRaftConfig(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			OrgName:  "test-org",
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "test", AuthToken: "token", DBNames: []string{"db1"}},
-		},
-		RaftConfig: manager.RaftConfig{
-			// Missing LocalDir, SnapshotDir, RaftBindAddr
-		},
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected validation error for missing raft config")
-	}
-}
-
-func TestManagerConfigValidate_EmbeddedModeNoAPIToken(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			// No API token needed in embedded mode
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "test", DBNames: []string{"db1"}},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-		UseEmbedded: true, // Embedded mode doesn't require Turso credentials
-	}
-
-	err := cfg.Validate()
+// A pureLocal group opens encrypted local files that work at once; they have
+// no replica to report on; with no raft block IsLeader keeps its old meaning,
+// true; and Shutdown leaves no goroutine behind.
+func TestLocalGroupOpensAndShutsDownClean(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	m, err := NewManager(context.Background(), ManagerConfig{
+		Groups:     []GroupConfig{{GroupName: "mesh", DBNames: []string{"lad"}, PureLocal: true, EncryptionKey: b64Key()}},
+		RaftConfig: RaftConfig{LocalDir: t.TempDir()},
+	})
 	if err != nil {
-		t.Errorf("expected no error in embedded mode, got: %v", err)
+		t.Fatal(err)
+	}
+	db, err := m.Database("mesh", "lad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SyncStats(context.Background(), "mesh", "lad"); !errors.Is(err, database.ErrSyncStatsUnavailable) {
+		t.Errorf("SyncStats on a local file: got %v, want ErrSyncStatsUnavailable", err)
+	}
+	if !m.IsLeader() {
+		t.Error("IsLeader with no cluster declared must be true")
+	}
+	if _, err := m.Database("mesh", "other"); !errors.Is(err, ErrUnknownDatabase) {
+		t.Errorf("unknown database: got %v", err)
+	}
+	if _, err := m.Job("mesh", "lad", "sweep", nil); !errors.Is(err, ErrNoCluster) {
+		t.Errorf("a job on a group with no raft block: got %v", err)
+	}
+	if err := m.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Shutdown(); err != nil {
+		t.Errorf("a second Shutdown: %v", err)
 	}
 }
 
-func TestManagerConfigValidate_PureLocalGroupNoAuthToken(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			OrgName:  "test-org",
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "local", DBNames: []string{"cache"}, PureLocal: true},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-		UseEmbedded: false,
+// Files of different kinds never share a path, whatever the group and
+// database are called: a group "raft" holding a database "logs" would
+// otherwise put the database where Raft keeps its log.
+func TestPathsKeepDatabasesAndRaftStateApart(t *testing.T) {
+	dir := "/data/tursoraft"
+	paths := map[string]bool{
+		replicaPath(dir, "raft", "logs"):            true,
+		localPath(dir, "raft", "logs"):              true,
+		raftDir(dir, "raft", "logs") + "/logs.db":   true,
+		raftDir(dir, "raft", "logs") + "/stable.db": true,
 	}
-
-	err := cfg.Validate()
-	if err != nil {
-		t.Errorf("expected no error for pure-local group without auth token, got: %v", err)
+	if len(paths) != 4 {
+		t.Fatalf("paths collide: %v", paths)
 	}
 }
 
-func TestManagerConfigValidate_Success(t *testing.T) {
-	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: "test-token",
-			OrgName:  "test-org",
-		},
-		Groups: []manager.GroupConfig{
-			{GroupName: "test", AuthToken: "token", DBNames: []string{"db1"}},
-		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "/tmp/test",
-			SnapshotDir:  "/tmp/snapshots",
-			RaftBindAddr: ":8300",
-		},
-	}
-
-	err := cfg.Validate()
+// manager/ never imports the platform API client: nothing at boot may need
+// an organisation token.
+func TestManagerDoesNotImportThePlatformClient(t *testing.T) {
+	out, err := exec.Command("go", "list", "-deps", ".").CombinedOutput()
 	if err != nil {
-		t.Errorf("expected no error, got: %v", err)
+		t.Fatalf("go list: %v\n%s", err, out)
+	}
+	for _, dep := range strings.Fields(string(out)) {
+		if strings.HasSuffix(dep, "tursoraft/internal/turso") {
+			t.Fatalf("manager depends on %s", dep)
+		}
+	}
+}
+
+// Shutdown on a manager with nothing opened returns at once.
+func TestEmptyManager(t *testing.T) {
+	m, err := NewManager(context.Background(), ManagerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { m.Shutdown(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown of an empty manager did not return")
 	}
 }

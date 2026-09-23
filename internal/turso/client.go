@@ -1,169 +1,187 @@
+// Package turso is the operator's client for the Turso platform API and for a
+// primary's HTTP statement endpoint.
+//
+// Its only importer is cmd/tursoraft-admin. A Manager never imports it: an
+// endpoint opens every shared database from the url and token in its signed
+// document and holds no organisation token (manager's
+// TestManagerDoesNotImportThePlatformClient keeps it so).
 package turso
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// TursoConfig represents Turso Platform API configuration (local copy to avoid import cycle).
-type TursoConfig struct {
-	APIToken string `json:"apiToken"`
-	OrgName  string `json:"orgName"`
-	BaseURL  string `json:"baseUrl"`
+// DefaultBaseURL is the platform API.
+const DefaultBaseURL = "https://api.turso.tech"
+
+// Errors.
+var (
+	// ErrNotFound means the platform has no database by that name.
+	ErrNotFound = errors.New("turso: database not found")
+	// ErrWrongGroup means a database by that name exists in another group.
+	ErrWrongGroup = errors.New("turso: database exists in another group")
+)
+
+// APIError is a non-2xx platform answer. Body is the platform's own
+// explanation, which is what an operator needs to act on a 403.
+type APIError struct {
+	Method, Path string
+	Status       int
+	Body         string
 }
 
-// TursoClient provides methods to interact with the Turso Platform API
-type TursoClient struct {
-	config     TursoConfig
-	httpClient *http.Client
+func (e *APIError) Error() string {
+	return fmt.Sprintf("turso: %s %s: %d %s: %s", e.Method, e.Path, e.Status, http.StatusText(e.Status), e.Body)
 }
 
-// NewTursoClient creates a new Turso API client
-func NewTursoClient(cfg TursoConfig) *TursoClient {
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = "https://api.turso.tech"
-	}
-
-	return &TursoClient{
-		config: cfg,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-	}
+// Client calls the platform API for one organisation.
+type Client struct {
+	Org     string
+	Token   string // organisation token; never logged
+	BaseURL string
+	HTTP    *http.Client
 }
 
-// Database represents a Turso database
+// Database is a database as the platform describes it. Only documented
+// fields are read.
 type Database struct {
-	Name       string `json:"name"`
-	Group      string `json:"group"`
-	PrimaryURL string `json:"primary_url"`
-	Hostname   string `json:"hostname"`
-	// Version is the server version reported by the Platform API. Legacy sqld
-	// databases report values like "0.24.29"; new tursodb-backed databases
-	// report calendar versions like "2026.6.0". We use this to pick a
-	// compatible connector — tursogo's sync engine speaks only to the new
-	// platform.
-	Version string `json:"version"`
+	Name     string `json:"Name"`
+	DbID     string `json:"DbId"`
+	Hostname string `json:"Hostname"`
+	Group    string `json:"group"`
 }
 
-// Group represents a Turso group
-type Group struct {
-	Name      string     `json:"name"`
-	Primary   string     `json:"primary"`
-	Locations []string   `json:"locations"`
-	Databases []Database `json:"databases"`
-}
+// URL is the primary's libSQL URL.
+func (d Database) URL() string { return "libsql://" + d.Hostname }
 
-// makeRequest makes an authenticated request to the Turso API
-func (tc *TursoClient) makeRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
-	var reqBody strings.Reader
+func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	base := c.BaseURL
+	if base == "" {
+		base = DefaultBaseURL
+	}
+	var rd io.Reader
 	if body != nil {
-		jsonBody, err := json.Marshal(body)
+		raw, err := json.Marshal(body)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal request body: %w", err)
+			return err
 		}
-		reqBody = *strings.NewReader(string(jsonBody))
+		rd = bytes.NewReader(raw)
 	}
-
-	url := tc.config.BaseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, url, &reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(base, "/")+path, rd)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return err
 	}
-
-	req.Header.Set("Authorization", "Bearer "+tc.config.APIToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := tc.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make request: %w", err)
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
-
-	return resp, nil
-}
-
-// getGroup retrieves information about a specific group
-func (tc *TursoClient) getGroup(ctx context.Context, groupName string) (*Group, error) {
-	resp, err := tc.makeRequest(ctx, "GET", fmt.Sprintf("/v1/organizations/%s/groups/%s", tc.config.OrgName, groupName), nil)
+	hc := c.HTTP
+	if hc == nil {
+		hc = &http.Client{Timeout: 30 * time.Second}
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("group %s not found", groupName)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return &APIError{Method: method, Path: path, Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
-
-	var result struct {
-		Group Group `json:"group"`
+	if out == nil {
+		return nil
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("turso: %s %s: decode: %w", method, path, err)
 	}
-
-	return &result.Group, nil
+	return nil
 }
 
-// createDatabase creates a new database in the specified group
-func (tc *TursoClient) createDatabase(ctx context.Context, groupName, dbName string) (*Database, error) {
-	reqBody := map[string]interface{}{
-		"name":  dbName,
-		"group": groupName,
+func (c *Client) orgPath(parts ...string) string {
+	p := "/v1/organizations/" + url.PathEscape(c.Org)
+	for _, s := range parts {
+		p += "/" + url.PathEscape(s)
 	}
+	return p
+}
 
-	resp, err := tc.makeRequest(ctx, "POST", fmt.Sprintf("/v1/organizations/%s/databases", tc.config.OrgName), reqBody)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	var result struct {
+// GetDatabase returns the named database, or ErrNotFound.
+func (c *Client) GetDatabase(ctx context.Context, name string) (Database, error) {
+	var out struct {
 		Database Database `json:"database"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	err := c.do(ctx, http.MethodGet, c.orgPath("databases", name), nil, &out)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+		return Database{}, fmt.Errorf("%w: %s", ErrNotFound, name)
 	}
-
-	return &result.Database, nil
+	return out.Database, err
 }
 
-// getDatabase retrieves information about a specific database
-func (tc *TursoClient) getDatabase(ctx context.Context, dbName string) (*Database, error) {
-	resp, err := tc.makeRequest(ctx, "GET", fmt.Sprintf("/v1/organizations/%s/databases/%s", tc.config.OrgName, dbName), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("database %s not found", dbName)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	var result struct {
+// CreateDatabase creates the named database in group.
+func (c *Client) CreateDatabase(ctx context.Context, name, group string) (Database, error) {
+	var out struct {
 		Database Database `json:"database"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	err := c.do(ctx, http.MethodPost, c.orgPath("databases"), map[string]string{"name": name, "group": group}, &out)
+	if err == nil && out.Database.Group == "" {
+		out.Database.Group = group
 	}
+	return out.Database, err
+}
 
-	return &result.Database, nil
+// EnsureDatabase returns the named database, creating it in group when it
+// does not exist, and refuses one that exists in another group: a name is
+// unique in the organisation, so the database found there is not the one the
+// document means.
+func (c *Client) EnsureDatabase(ctx context.Context, name, group string) (db Database, created bool, err error) {
+	db, err = c.GetDatabase(ctx, name)
+	switch {
+	case err == nil:
+		if db.Group != group {
+			return Database{}, false, fmt.Errorf("%w: %s is in group %q, not %q", ErrWrongGroup, name, db.Group, group)
+		}
+		return db, false, nil
+	case errors.Is(err, ErrNotFound):
+		db, err = c.CreateDatabase(ctx, name, group)
+		return db, err == nil, err
+	default:
+		return Database{}, false, err
+	}
+}
+
+// CreateToken mints a token scoped to one database. expiration is the
+// platform's form ("never", "2w", ...); readOnly limits it to reads.
+func (c *Client) CreateToken(ctx context.Context, name, expiration string, readOnly bool) (string, error) {
+	q := url.Values{}
+	if expiration != "" {
+		q.Set("expiration", expiration)
+	}
+	if readOnly {
+		q.Set("authorization", "read-only")
+	} else {
+		q.Set("authorization", "full-access")
+	}
+	var out struct {
+		JWT string `json:"jwt"`
+	}
+	if err := c.do(ctx, http.MethodPost, c.orgPath("databases", name, "auth", "tokens")+"?"+q.Encode(), nil, &out); err != nil {
+		return "", err
+	}
+	if out.JWT == "" {
+		return "", errors.New("turso: the platform returned no token")
+	}
+	return out.JWT, nil
 }
