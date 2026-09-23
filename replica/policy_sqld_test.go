@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,8 +71,8 @@ func TestPolicyProofReachesThePrimary(t *testing.T) {
 // A replica pool proves foreign keys only when a connection opens, so its
 // guard is what keeps them on afterwards: a statement that turns them off is
 // refused with policypool.ErrPolicyRefused before it reaches the primary, and
-// the pool cannot write an orphan. The same statement on a raw engine
-// connection is accepted, and that connection then writes the orphan.
+// an orphan write fails its foreign-key check. The same statement on a raw
+// engine connection is accepted, and that connection then writes the orphan.
 func TestTheGuardHoldsForeignKeysOnAReplicaPool(t *testing.T) {
 	s := sqldtest.Start(t)
 	ctx := context.Background()
@@ -88,8 +89,8 @@ func TestTheGuardHoldsForeignKeysOnAReplicaPool(t *testing.T) {
 			t.Errorf("pool %q: got %v, want ErrPolicyRefused", q, err)
 		}
 	}
-	if _, err := r.DB().ExecContext(ctx, "INSERT INTO c VALUES (1, 99)"); err == nil {
-		t.Error("the pool wrote an orphan row")
+	if _, err := r.DB().ExecContext(ctx, "INSERT INTO c VALUES (1, 99)"); err == nil || !strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+		t.Errorf("the pool's orphan write got %v, want a foreign-key failure", err)
 	}
 
 	raw := sql.OpenDB(r.native)
