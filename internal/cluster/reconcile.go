@@ -65,9 +65,10 @@ func (c *Cluster) heartbeatsFailing(id string) bool {
 }
 
 // reconcile is the leader's pass over membership and assignments. Each pass
-// makes at most one membership change, then re-reads the configuration on the
-// next pass, so no decision is made from a configuration that change made
-// stale.
+// makes at most one membership change, or one swap in balanceVoters (a
+// promotion and the demotion it pays for, both chosen before either is
+// made), then re-reads the configuration on the next pass, so no other
+// decision is made from a configuration that change made stale.
 func (c *Cluster) reconcile() {
 	c.mu.Lock()
 	c.lastRecon = time.Now()

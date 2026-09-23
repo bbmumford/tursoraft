@@ -116,7 +116,7 @@ func TestAHostThatDoesNotVoteNeedsNoVolume(t *testing.T) {
 	}
 }
 
-// The fields a caller's older wiring still sets are accepted and ignored.
+// The fields loom's node runtime sets and a Manager ignores are accepted.
 func TestIgnoredFieldsAreAccepted(t *testing.T) {
 	cfg := ManagerConfig{
 		Groups:      []GroupConfig{{GroupName: "mesh", DBNames: []string{"lad"}, PureLocal: true, EncryptionKey: b64Key()}},
