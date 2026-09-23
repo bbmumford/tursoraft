@@ -87,6 +87,24 @@ func TestMemoryMesh(t *testing.T) {
 	exercise(t, a, b, func() { h.Isolate("a") })
 }
 
+// Each Isolate makes an island of its own, whatever earlier calls moved: a
+// node isolated twice and then another node isolated alone never share one.
+func TestEachIsolateMakesANewIsland(t *testing.T) {
+	h := NewHub()
+	a, b := h.Node("a", "svc-a"), h.Node("b", "svc-b")
+	defer a.Close()
+	defer b.Close()
+	if err := b.Publish("k", map[string]string{"role": "host"}); err != nil {
+		t.Fatal(err)
+	}
+	h.Isolate("a")
+	h.Isolate("a")
+	h.Isolate("b")
+	if m := a.Members("k"); len(m) != 0 {
+		t.Errorf("a, isolated on its own, sees %v", m)
+	}
+}
+
 func TestLoopbackMesh(t *testing.T) {
 	dir := t.TempDir()
 	a, err := NewLoopback(dir, "a", "svc-a")
