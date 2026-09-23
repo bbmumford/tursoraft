@@ -99,8 +99,8 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	return m, nil
 }
 
-// warnIgnored logs the fields a caller set that no longer do anything, so an
-// operator reading the log sees that Raft does not listen on a port.
+// warnIgnored logs the ignored fields a caller set, so an operator reading the
+// log sees that Raft does not listen on a port.
 func (m *Manager) warnIgnored() {
 	c := m.cfg
 	if c.RaftConfig.RaftBindAddr != "" || c.PeerEnvVar != "" || c.TursoConfig.APIToken != "" {

@@ -14,8 +14,8 @@ import (
 )
 
 // A pureLocal group opens encrypted local files that work at once; they have
-// no replica to report on; with no raft block IsLeader keeps its old meaning,
-// true; and Shutdown leaves no goroutine behind.
+// no replica to report on; with no raft block IsLeader is true; and Shutdown
+// leaves no goroutine behind.
 func TestLocalGroupOpensAndShutsDownClean(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	m, err := NewManager(context.Background(), ManagerConfig{

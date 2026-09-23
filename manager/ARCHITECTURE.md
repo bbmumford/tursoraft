@@ -73,7 +73,7 @@ applies a new random cluster ID. Hosts never bootstrap.
 ## Reconciler
 
 The leader reconciles every 10 s and whenever the mesh changes (at most every
-100 ms), making at most one membership change per pass:
+100 ms), making at most one membership change per pass, or one swap (step 4):
 
 1. A live participant missing from the configuration is probed, then added as
    a non-voter.
@@ -114,7 +114,11 @@ time it is missing.
 
 Entries carry `v`. An entry of another version, or of an unknown op, halts the
 member's FSM: it refuses that entry and every later one, stops its jobs and
-alerts. New versions are proposed only when every member advertises them.
+alerts. This build proposes only version 1, and a member publishing a lower
+`fsmv` is not counted for bootstrap, added or assigned. Nothing holds a newer
+version's entries back until every member of the configuration advertises
+that version, so a build that introduces a second version must add that gate
+before it proposes one.
 
 ## Timing
 

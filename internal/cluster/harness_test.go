@@ -251,7 +251,8 @@ func eventually(t testing.TB, within time.Duration, what string, cond func() boo
 	}
 }
 
-// serviceOf maps the ids the tests use to their service.
+// count is how many ids begin with prefix. The tests name each member by its
+// service's letter: a for node.orbtr.ai, b for node.orbtr.io, h for api.orbtr.ai.
 func count(ids []string, prefix string) int {
 	n := 0
 	for _, id := range ids {
