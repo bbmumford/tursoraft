@@ -1,284 +1,186 @@
 # tursoraft
 
-A Go package for distributed Turso/libraryQL databases with Raft consensus for strong consistency across mesh nodes.
+A process's shared and local SQL databases, and a Raft cluster per shared
+database that decides which process runs each singleton job.
 
-## Overview
+- **Shared database**: one authoritative copy, the *primary* (libSQL, in Turso
+  Cloud or a sqld). Every process that holds it keeps an encrypted embedded
+  *replica* (go-libsql). Reads are answered from the replica file; every write
+  is sent to the primary and returns once the primary has it. Every holder
+  writes; no write waits for Raft or a leader.
+- **Local database**: a file one process owns, through tursogo, encrypted.
+- **Raft cluster**: one per shared database that declares singleton jobs. It
+  carries job assignments and a cluster ID, never rows. The leader gives each
+  job to one live host and stamps the assignment with an *epoch* (the log
+  index). The job's writes go through `fence.Fence.Tx`, which the primary
+  orders by that epoch, so a holder that lost the job cannot write after the
+  new holder has.
 
-`tursoraft` combines **Turso (libraryQL)** with **Raft Consensus** to create a hybrid cloud/edge distributed database. It provides strongly-consistent, replicated data storage with automatic synchronization between mesh nodes and optional cloud databases.
+Raft runs over a `mesh.Mesh` the caller supplies (a mesh runtime implements
+it; `mesh/meshtest` has an in-memory and a TCP-loopback one). Nothing in
+tursoraft reads an environment variable or calls the Turso platform API at
+boot.
 
-## When to Use TursoRaft vs TursoKV
+## Packages
 
-| Use Case | TursoRaft | TursoKV |
-|----------|-----------|---------|
-| **Mesh node coordination** | ✅ Best fit | ❌ No consensus |
-| **Distributed sessions/auth** | ✅ Strong consistency | ❌ Eventual only |
-| **Multiple nodes same data** | ✅ Raft replication | ❌ Cloud sync lag |
-| **Single-node/edge caching** | ❌ Overkill | ✅ Best fit |
-| **Offline-first mobile** | ❌ Requires cluster | ✅ Embedded replica |
+| Package | What it is |
+|---|---|
+| `manager` | `NewManager`, `Database`, `Job`, `Leader`, `Sync`, `SyncOnMiss`, `SyncStats`, `Health`, `Shutdown`, and the deprecated `IsLeader` |
+| `replica` | One encrypted embedded replica: open with retry, plaintext check, sync loop, stats (cgo; a stub without) |
+| `localdb` | One encrypted tursogo file through policypool |
+| `fence` | `Fence.Tx`: epoch-fenced write transactions |
+| `mesh`, `mesh/meshtest` | The transport contract Raft runs over, and test meshes |
+| `connectors` | `MakeConnector`, one handle outside a Manager |
+| `database` | `DatabaseHandle` and `SyncStats` |
+| `cmd/tursoraft-admin` | Operator tool: `ensure`, `token`, `fence-adopt` |
 
-**Rule of thumb**:
-- **TursoRaft** = Multiple mesh nodes that must agree on state (auth, sessions, coordination)
-- **TursoKV** = Single node or edge devices syncing to cloud
-
-## Architecture
-
-```
-[ Mesh Node A ] <───Raft───> [ Mesh Node B ] <───Raft───> [ Mesh Node C ]
-   (leader)                    (follower)                   (follower)
-      │                            │                            │
-      └────────────────────────────┼────────────────────────────┘
-                                   │
-                            (optional sync)
-                                   │
-                                   v
-                            [ Turso Cloud ]
-```
-
-1. **Raft Consensus**: Strong consistency via HashiCorp Raft
-2. **Embedded Replicas**: Local SQLite on each node (fast reads)
-3. **Concurrent Writes**: MVCC via `BEGIN CONCURRENT` (always enabled)
-4. **Optional Cloud Sync**: Backup/disaster recovery to Turso Cloud
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| **Raft Consensus** | Strong consistency via HashiCorp Raft |
-| **Concurrent Writes** | MVCC `BEGIN CONCURRENT` enabled by default |
-| **Encryption at Rest** | AES-256/AEGIS-256 via go-libsql |
-| **Embedded Replicas** | Local SQLite for fast reads |
-| **Multi-Database** | Multiple databases across groups |
-| **Auto-Sync** | Leader syncs to Turso Cloud |
-| **Snapshot/Restore** | Full snapshot support for recovery |
-
-## Installation
-
-```bash
-go get github.com/bbmumford/tursoraft
-```
-
-**⚠️ CGO Required**: Uses `go-libsql` for embedded replicas and concurrent writes.
-
-## Build Tags
-
-TursoRaft supports two build modes via conditional compilation:
-
-| Build Command | Mode | Use Case |
-|--------------|------|----------|
-| `go build ./...` | **Remote** (default) | Connect to Turso Cloud databases only |
-| `go build -tags libsql_embed ./...` | **Embedded** | Local SQLite + optional Turso sync |
-
-### When to use `-tags libsql_embed`
-
-Use the `libsql_embed` build tag when you need:
-
-- **Pure local databases** (no Turso Cloud connection)
-- **Embedded replicas** with local SQLite files
-- **Offline-capable** operation
-- **LAD (mesh ephemeral state)** storage
-
-```bash
-# Build with embedded libraryQL support
-go build -tags libsql_embed ./...
-
-# Docker: Enable in Dockerfile
-RUN go build -tags libsql_embed -v -o server .
-```
-
-**Note**: The embedded mode requires CGO and `go-libsql`. The runtime image needs glibc (use `distroless/base-debian12`, not `static-debian12`).
-
-### Runtime behavior difference
-
-```go
-// With default build (remote mode):
-handle, err := connectors.MakeConnector(path, "", "", "")
-// Returns error: "embedded libraryQL support not enabled; rebuild with -tags libsql_embed"
-
-// With -tags libsql_embed:
-handle, err := connectors.MakeConnector(path, "", "", "")
-// Creates a pure local SQLite database at `path`
-```
-
-## Package Structure
-
-```
-tursoraft/
-├── connectors/       # Public: Database connectors
-│   ├── connector_embed.go    # (build tag: libsql_embed) - Local/embedded mode
-│   ├── connector_remote.go   # (build tag: !libsql_embed) - Remote Turso mode
-│   └── connector_manager.go  # Connection pool manager
-├── database/         # Public: DatabaseHandle type
-├── manager/          # Public: Main API entry point
-│   ├── manager.go    #   Config types + Manager implementation
-│   └── manager_test.go
-├── internal/         # Private: Implementation details
-│   ├── raft/         #   Raft consensus (FSM, peers, snapshots)
-│   └── turso/        #   Turso Platform API client
-└── examples/         # Usage examples
-```
-
-## Usage
-
-### Basic Setup
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-    
-    "github.com/bbmumford/tursoraft/manager"
-)
-
-func main() {
-    cfg := manager.ManagerConfig{
-        TursoConfig: manager.TursoConfig{
-            APIToken: "your-platform-api-token",
-            OrgName:  "your-org",
-        },
-        Groups: []manager.GroupConfig{
-            {
-                GroupName: "mygroup",
-                AuthToken: "your-db-auth-token",
-                DBNames:   []string{"core", "sessions"},
-            },
-        },
-        RaftConfig: manager.RaftConfig{
-            RaftBindAddr: ":7000",
-            LocalDir:     "/var/lib/tursoraft",
-            SnapshotDir:  "/var/lib/tursoraft/snapshots",
-        },
-    }
-    
-    mgr, err := manager.NewManager(context.Background(), cfg)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer mgr.Shutdown()
-    
-    // Get database handle
-    db, err := mgr.Database("mygroup", "core")
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // Use standard database/sql interface
-    _, err = db.Exec("INSERT INTO users (name) VALUES (?)", "alice")
-}
-```
-
-### With Encryption
-
-```go
-cfg := manager.ManagerConfig{
-    Groups: []manager.GroupConfig{
-        {
-            GroupName:     "mygroup",
-            AuthToken:     "db-auth-token",
-            DBNames:       []string{"core"},
-            EncryptionKey: "32-byte-key-for-encryption!!!!!",
-        },
-    },
-    // ...
-}
-```
-
-### Pure Local Mode (No Cloud Sync)
-
-For mesh nodes that don't need cloud backup:
-
-```go
-cfg := manager.ManagerConfig{
-    Groups: []manager.GroupConfig{
-        {
-            GroupName: "local",
-            DBNames:   []string{"cache"},
-            PureLocal: true,  // No Turso sync, pure local SQLite
-        },
-    },
-    // ...
-}
-```
-
-Pure-local groups do not require `AuthToken`, because they never connect to Turso Cloud.
-Pure-local groups also skip Turso Platform API group validation and database provisioning entirely, so the corresponding Turso group does not need to exist.
+Every `*sql.DB` tursoraft returns comes from `policypool` with
+`ForeignKeysRequired`: every connection proves `foreign_keys=1` when it opens
+and on every reuse, and a statement that would turn it off is refused.
 
 ## Configuration
 
-### ManagerConfig
 ```go
-type ManagerConfig struct {
-    TursoConfig  TursoConfig   // Turso Platform API settings
-    RaftConfig   RaftConfig    // Raft consensus settings
-    Groups       []GroupConfig // Database groups to manage
-    PeerEnvVar   string        // Environment variable for peer discovery
-    SyncInterval time.Duration // How often to sync to Turso Cloud
-    SnapMinGap   time.Duration // Minimum time between snapshots
-}
+mgr, err := manager.NewManager(ctx, manager.ManagerConfig{
+    Groups: []manager.GroupConfig{{
+        GroupName:     "control",
+        DBNames:       []string{"orbtr-control"},
+        EncryptionKey: groupKey, // base64 of exactly 32 bytes
+        Databases: []manager.DatabaseConfig{{
+            Name: "orbtr-control", URL: "libsql://orbtr-control-orbtr.turso.io", AuthToken: dbToken,
+        }},
+        Raft: &manager.RaftSpec{
+            VoterServices:   []string{"node.orbtr.ai", "node.orbtr.io"},
+            VoterCount:      5,
+            BootstrapExpect: 3,
+            Jobs:            map[string][]string{"projector": {"api.orbtr.ai", "node.orbtr.io"}},
+        },
+    }},
+    RaftConfig: manager.RaftConfig{LocalDir: "/data/tursoraft"},
+    VolumeDir:  "/data",
+    Mesh:       mesh, // implements mesh.Mesh
+})
 ```
 
-When `RaftBindAddr` is configured as a wildcard listen address such as `:7331`,
-tursoraft now derives an advertisable peer identity automatically. It prefers
-`TURSORAFT_ADVERTISE_HOST`, then `RAFT_ADVERTISE_HOST`, then Fly.io's
-`FLY_PRIVATE_IP`, and falls back to the machine hostname.
+`Validate` (run by `NewManager`) needs no network and refuses: a relative
+`LocalDir`; a group without a 32-byte key; a shared database without a url or
+a token (a database's own token, else the group's); a group, database or job
+name outside `^[a-z0-9][a-z0-9_-]*$`; a raft block over other than one shared
+database, with no voters, or with `bootstrapExpect` outside `1..voterCount`; a
+raft block with no mesh; a voter whose state is not under `VolumeDir`; and, in
+a build without cgo, any shared group (`ErrReplicaNeedsCGO`).
 
-### TursoConfig
+`TursoConfig`, `PeerEnvVar`, `SnapMinGap`, `UseEmbedded`,
+`RaftConfig.RaftBindAddr` and `RaftConfig.SnapshotDir` are accepted and
+ignored; loom's node runtime sets them.
+
+## Files
+
+Everything lives under `LocalDir`, each kind under its own prefix so no two
+kinds ever share a path:
+
+| Path | What |
+|---|---|
+| `replicas/<group>/<db>.db` (+ `-wal`, `-shm`, `-client_wal_index`) | Replica of a shared database; a cache |
+| `local/<group>/<db>.db` | Local database; the only copy of its rows |
+| `raft/<group>/<db>/{logs.db,stable.db,snapshots/}` | A voter's Raft state; job hosts keep theirs in memory |
+
+## Boot
+
+1. Validate, with no network.
+2. For each shared database: with a key configured, a replica file that begins
+   with the plaintext SQLite header is deleted (it is a cache).
+3. Open the replica (`WithEncryption`, `WithReadYourWrites`, `WithRawText`,
+   `WithImmediateTransactions`), retrying an unreachable primary for the open
+   timeout (60 s), then fail. There is no fallback.
+4. Wrap it with `policypool.OpenConnector(…, ForeignKeysRequired)` and start
+   its sync loop (every sync interval, default 5 s, jittered ±20%).
+5. Open local databases through tursogo, encrypted, through policypool.
+6. `Database()` works from here and never waits for Raft.
+7. Start each Raft cluster this process has a seat in.
+8. The endpoint applies its schema, calls `Sync`, then serves.
+
+## Jobs
+
 ```go
-type TursoConfig struct {
-    APIToken string // Platform API token (for management, not queries)
-    OrgName  string // Organization name
-    BaseURL  string // Optional: override API base URL
-}
+db, _ := mgr.Database("control", "orbtr-control")
+job, err := mgr.Job("control", "orbtr-control", "projector", func(ctx context.Context, f fence.Fence) error {
+    for ctx.Err() == nil {
+        err := f.Tx(ctx, db, func(tx *sql.Tx) error {
+            // this holder's writes for one step
+            return nil
+        })
+        if errors.Is(err, fence.ErrFenced) {
+            return err // a newer holder has written; stop
+        }
+        // wait for the next step or ctx
+    }
+    return nil
+})
 ```
 
-### GroupConfig
-```go
-type GroupConfig struct {
-    GroupName     string   // Turso group name
-    AuthToken     string   // Auth token for query execution
-    DBNames       []string // Database names in this group
-    EncryptionKey string   // Optional: data-at-rest encryption (32 bytes)
-    PureLocal     bool     // If true, no Turso sync
-}
+The body runs while this process holds the job and gets a context that ends
+when the job moves or the manager shuts down. If it returns while the job is
+still held it runs again after a backoff. For about one election timeout
+after a failover two processes may both believe they hold a job; `Fence.Tx`
+refuses the stale one's writes once the new one has written. Effects outside
+the fenced database must be idempotent.
+
+`Fence.Tx` begins with `BEGIN IMMEDIATE`, records the epoch in
+`_tursoraft_fence`, runs the body and commits. Keep the body short: the
+primary rolls back a write transaction held for about five seconds.
+
+## Rules for code on a shared database
+
+- A read and then a write outside one transaction loses the update another
+  process makes in between. Use one `BeginTx` (which is `BEGIN IMMEDIATE`) or
+  one conditional statement.
+- Schema is applied by every instance at boot, not by a leader; each step must
+  be idempotent and run in one transaction with its ledger check.
+
+## Operator tool
+
+```
+TURSO_API_TOKEN=… tursoraft-admin ensure -org orbtr -group control -db orbtr-control
+TURSO_API_TOKEN=… tursoraft-admin token  -org orbtr -db orbtr-control
+TURSO_DB_TOKEN=…  tursoraft-admin fence-adopt -url libsql://… -cluster <new id> -confirm-old-cluster-gone
 ```
 
-### RaftConfig
-```go
-type RaftConfig struct {
-    RaftBindAddr string // Address for Raft transport (e.g., ":7000")
-    LocalDir     string // Directory for Raft logs and replicas
-    SnapshotDir  string // Directory for Raft snapshots
-}
+`ensure` refuses a database that exists in another group. `fence-adopt` is
+for the case where every voter lost its Raft state and a new cluster formed:
+the fence rows still name the old cluster, so the new cluster's jobs get
+`fence.ErrForeignCluster` until an operator who has stopped every member of
+the old cluster adopts the new ID (from `Manager.Health`).
+
+## Building and testing
+
+Shared groups need cgo (go-libsql is a C library). go-libsql and policypool
+resolve through `replace` directives to sibling checkouts; workspaces that
+use tursoraft carry the same lines in their `go.work`.
+
+Tests that need a primary start a local sqld on 127.0.0.1 and a free port
+and stop only the process they started. The binary is `$TURSORAFT_SQLD`, else
+`/opt/homebrew/bin/sqld`, else `sqld` on `PATH`; with none they skip. Tests
+that hold `BEGIN IMMEDIATE` on two replicas at once need sqld 0.24 or later
+and skip on older ones, which never answer the second replica.
+
+```
+TURSORAFT_SQLD=/path/to/sqld-0.24 go test -race -count=1 -p 2 ./...
 ```
 
-## Peer Discovery
+## Known limits
 
-Peers are discovered via environment variable:
-
-```bash
-export TURSORAFT_PEERS="node1:7000,node2:7000,node3:7000"
-```
-
-The node automatically removes itself from the peer list.
-
-## Concurrent Writes
-
-TursoRaft automatically enables `BEGIN CONCURRENT` (MVCC) for all embedded replica connections. This allows:
-
-- Multiple Raft followers to process reads concurrently
-- Row-level conflict detection instead of database-level locking
-- Better throughput for write-heavy workloads
-
-This is always-on and cannot be disabled (it's the right default for mesh nodes).
-
-## Dependencies
-
-- `github.com/hashicorp/raft` - Raft consensus
-- `github.com/hashicorp/raft-boltdb/v2` - BoltDB storage for Raft
-- `github.com/tursodatabase/go-libsql` - libraryQL Go bindings (CGO)
-- `github.com/tursodatabase/libsql-client-go` - libraryQL client
-
-## License
-
-MIT
+- **Every pooled statement reaches the primary.** policypool proves foreign
+  keys on each connection reuse, and go-libsql sends `PRAGMA foreign_keys` to
+  the primary. A pooled read therefore costs a round trip (2.5 ms against
+  0.03 ms for the engine's own read on loopback) and fails while the primary
+  is down, though the replica file could answer it.
+- **Replica key strength.** go-libsql takes the key as the base64 passphrase
+  and its cipher uses the passphrase's first 32 bytes, so the first 24 bytes
+  (192 bits) of the group key protect a replica file.
+- **A pull against a primary that refuses connections blocks about 3 s**
+  inside the engine before failing; `Sync` callers and `Close` wait for it.
+- **Raft timing.** Heartbeat and election timeouts are 1 s: a follower that
+  still has a leader refuses every vote until its own timer fires, so a killed
+  leader's job moves after the slowest follower's timer (1–2 s) plus the
+  reassignment.

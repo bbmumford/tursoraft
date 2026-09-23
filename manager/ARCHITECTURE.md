@@ -1,450 +1,156 @@
-# MeshDB Architecture Overview
-
-## Purpose
-
-MeshDB is a distributed database layer that provides:
-- **Cloud-Native Storage**: Turso databases (libraryQL) in the cloud
-- **Local Replicas**: Fast local read access via SQLite
-- **Distributed Consensus**: Raft protocol for coordination across nodes
-- **Strong Consistency**: Write-ahead logging with majority quorum
-
-## Key Concepts
-
-### Two Separate APIs
-
-MeshDB interacts with Turso through TWO distinct APIs:
-
-#### 1. libraryQL Go SDK (Query Execution)
-- **Purpose**: ALL SQL query execution
-- **Package**: `github.com/tursodatabase/libsql-client-go/libsql`
-- **Reference**: https://docs.turso.tech/sdk/go/quickstart
-- **Used For**:
-  - SELECT, INSERT, UPDATE, DELETE
-  - DDL (CREATE TABLE, ALTER, DROP)
-  - Transactions
-  - All data operations
-
-**Connection Pattern**:
-```go
-import _ "github.com/tursodatabase/libsql-client-go/libsql"
-
-dsn := fmt.Sprintf("%s?authToken=%s", databaseURL, authToken)
-db, err := sql.Open("libsql", dsn)
-// db is a standard *sql.DB - use it like any Go database
-```
-
-#### 2. Turso Platform API (Database Management)
-- **Purpose**: Database provisioning and configuration ONLY
-- **Location**: `internal/turso/client.go`
-- **Used For**:
-  - Creating new databases
-  - Managing database groups
-  - Configuring replication
-  - Retrieving database URLs
-
-**Important**: The Platform API **cannot** and **should not** be used for SQL queries.
-
-### Authentication Tokens
-
-MeshDB requires TWO different tokens:
-
-#### Platform API Token
-- **Field**: `TursoConfig.APIToken`
-- **Scope**: Organization-level administrative operations
-- **Used For**: Database provisioning, group management
-- **Permissions**: Create/delete databases, manage infrastructure
-
-#### Database Auth Token  
-- **Field**: `GroupConfig.AuthToken`
-- **Scope**: Database-level read/write access
-- **Used For**: SQL query execution via libraryQL SDK
-- **Permissions**: Execute queries on specific databases
-- **Exception**: Not required when `GroupConfig.PureLocal=true`, because that group runs as local SQLite + Raft only with no Turso sync
-
-#### Pure-Local Group Provisioning
-- **Field**: `GroupConfig.PureLocal`
-- **Behavior**: Skips Turso Platform API group validation and database provisioning
-- **Implication**: The named group only needs to exist in local Tursoraft configuration; it does not need a matching Turso Cloud group
-
-## Architecture Components
-
-### Manager
-The main entry point for MeshDB operations.
-
-**Location**: `manager/manager.go`
-
-**Key Methods**:
-```go
-// Initialization
-NewManager(ctx, cfg) (*Manager, error)          // Standard setup
-NewManagerWithTransport(...)                     // Custom transport (e.g., HTTPS port 443)
-
-// Database Access
-Database(group, dbName) (*sql.DB, error)        // Get database handle
-Exec(ctx, group, db, sql, args)                 // Coordinated writes
-Query(ctx, group, db, sql, args)                // Fast local reads
-
-// Cluster Management
-AddPeer(addr) error                              // Expand cluster
-RemovePeer(addr) error                           // Shrink cluster
-GetPeers() ([]string, error)                     // List peers
-GetLeader() (string, error)                      // Find current leader
-IsLeader() bool                                  // Check local leadership
-
-// Lifecycle
-Shutdown() error                                 // Graceful shutdown
-```
-
-### Configuration
-Complete configuration for MeshDB initialization.
-
-**Location**: `manager/manager.go` (config types are in the same file)
-
-**Structure**:
-```go
-type ManagerConfig struct {
-    TursoConfig  TursoConfig      // Platform API settings
-    RaftConfig   RaftConfig       // Raft consensus settings
-    Groups       []GroupConfig    // Database groups
-    PeerEnvVar   string           // Peer discovery env var
-    SyncInterval time.Duration    // Turso sync frequency
-    SnapMinGap   time.Duration    // Snapshot throttling
-    UseEmbedded  bool             // Embedded mode flag
-}
-```
-
-### Connector System
-Manages libraryQL connections to Turso databases.
-
-**Location**: `connectors/`
-
-**Files**:
-- `connector_remote.go` - Standard Turso connection (build tag: `!libsql_embed`)
-- `connector_embed.go` - Embedded SQLite mode (build tag: `libsql_embed`)
-- `connector_manager.go` - Connection pool management
-
-**Database Handle**: `database/database_handle.go`
-
-**Connection Process**:
-1. Parse database group and name → construct database key
-2. Retrieve Turso database URL from Platform API
-3. Build DSN with URL + auth token
-4. Open libraryQL connection via `sql.Open("libsql", dsn)`
-5. Store in connection pool for reuse
-
-### Raft Consensus
-Distributed coordination across MeshDB nodes.
-
-**Location**: `internal/raft/raft.go`
-
-**Features**:
-- Leader election (automatic, <1s failover)
-- Write serialization (all writes through leader)
-- Log replication (majority quorum required)
-- Snapshot/restore (periodic compaction)
-
-**Cluster Formation**:
-```bash
-# Set peers via environment variable
-export MESHDB_PEERS="node1:443,node2:443,node3:443"
-
-# Or add dynamically
-mgr.AddPeer("node4:443")
-```
-
-If `RaftBindAddr` is set to a wildcard listener like `:7331`, MeshDB binds on
-that port but advertises a routable node identity instead of the wildcard
-address. The advertise host resolution order is:
-
-1. `TURSORAFT_ADVERTISE_HOST`
-2. `RAFT_ADVERTISE_HOST`
-3. `FLY_PRIVATE_IP`
-4. Hostname / first non-loopback interface
-
-### Finite State Machine (FSM)
-Applies Raft log entries to local databases.
-
-**Location**: `internal/raft/fsm.go`
-
-**Process**:
-1. Leader proposes write operation
-2. Raft replicates to majority of nodes
-3. FSM applies write to local database
-4. All nodes execute same operations in same order
-5. Strong consistency guaranteed
-
-## Data Flow
-
-### Write Operations
-
-```
-Client
-  ↓
-Manager.Exec(ctx, "hstles", "core", "INSERT INTO users ...")
-  ↓
-Create Raft log entry
-  ↓
-Propose to Raft cluster
-  ↓
-Wait for majority consensus
-  ↓
-FSM applies to local database (all nodes)
-  ↓
-Return success
-```
-
-**Characteristics**:
-- Latency: Network RTT + consensus time (~10-50ms typical)
-- Consistency: Strong (linearizable)
-- Availability: Requires majority quorum
-
-### Read Operations
-
-```
-Client
-  ↓
-Manager.Query(ctx, "hstles", "core", "SELECT * FROM users")
-  ↓
-Query local replica directly (no Raft)
-  ↓
-Return results immediately
-```
-
-**Characteristics**:
-- Latency: Local database query (~1-5ms typical)
-- Consistency: Eventual (may lag leader by milliseconds)
-- Availability: Always available on any node
-
-### Alternative: Direct Database Access
-
-```
-Client
-  ↓
-db, _ := Manager.Database("hstles", "core")
-  ↓
-rows, _ := db.Query("SELECT * FROM users")  // Fast local reads
-  ↓
-_, _ = db.Exec("INSERT INTO ...")  // ⚠️ Bypasses Raft (DANGEROUS)
-```
-
-**Recommended Pattern**:
-- Use `Database()` for reads (fast, safe)
-- Use `Manager.Exec()` for writes (coordinated, safe)
-
-## Turso Integration
-
-### Database Setup
-
-Verify your Turso configuration:
-
-```bash
-# List groups
-turso group list
-# Output: hstles, calndr, orbtr
-
-# List databases
-turso db list
-# Output: core (hstles group), files (hstles group), etc.
-
-# Show database details
-turso db show core
-# Verify: Group=hstles, URL=libsql://core-hstles.turso.io
-```
-
-### MeshDB Configuration
-
-```go
-import "github.com/bbmumford/tursoraft/manager"
-
-cfg := manager.ManagerConfig{
-    TursoConfig: manager.TursoConfig{
-        APIToken: os.Getenv("TURSO_PLATFORM_TOKEN"),  // For provisioning
-        OrgName:  "hstles",
-        BaseURL:  "https://api.turso.tech",
-    },
-    Groups: []manager.GroupConfig{
-        {
-            GroupName: "hstles",                      // From: turso group list
-            DBNames:   []string{"core", "files"},     // From: turso db list
-            AuthToken: os.Getenv("TURSO_AUTH_TOKEN"), // For queries
-        },
-    },
-    RaftConfig: manager.RaftConfig{
-        RaftBindAddr: ":443",  // Firewall-friendly port
-        LocalDir:     "/var/lib/tursoraft",
-        SnapshotDir:  "/var/lib/tursoraft/snapshots",
-    },
-    SyncInterval: 5 * time.Minute,
-}
-
-mgr, err := manager.NewManager(context.Background(), cfg)
-if err != nil {
-    log.Fatal(err)
-}
-defer mgr.Shutdown()
-
-// Get database handle
-platformDB, err := mgr.Database("hstles", "core")
-if err != nil {
-    log.Fatal(err)
-}
-
-// Use standard database/sql operations
-rows, err := platformDB.Query("SELECT * FROM users WHERE active = ?", true)
-```
-
-### Synchronization
-
-MeshDB periodically syncs from Turso:
-
-1. **Leader-Only Operation**: Only the Raft leader performs syncs
-2. **Scheduled Interval**: Every `SyncInterval` duration
-3. **Change Detection**: Only syncs if local database changed
-4. **Snapshot Creation**: Creates Raft snapshot after successful sync
-5. **Replication**: New snapshot distributed to all nodes
-
-## Cluster Deployment
-
-### Single Node (Development)
-
-```go
-cfg := manager.ManagerConfig{
-    // ... configuration ...
-    RaftConfig: manager.RaftConfig{
-        RaftBindAddr: ":443",
-        LocalDir:     "./meshdb_data",
-        SnapshotDir:  "./meshdb_snapshots",
-    },
-    PeerEnvVar: "MESHDB_PEERS",  // Empty env var = single node
-}
-
-mgr, _ := manager.NewManager(ctx, cfg)
-// Starts immediately, no peer discovery
-```
-
-### Multi-Node Cluster
-
-**Node 1**:
-```bash
-export MESHDB_PEERS="node2.internal:443,node3.internal:443"
-./service --raft-addr=:443
-```
-
-**Node 2**:
-```bash
-export MESHDB_PEERS="node1.internal:443,node3.internal:443"
-./service --raft-addr=:443
-```
-
-**Node 3**:
-```bash
-export MESHDB_PEERS="node1.internal:443,node2.internal:443"
-./service --raft-addr=:443
-```
-
-**Features**:
-- Automatic peer discovery via environment variable
-- Self-removal from peer list (avoids self-connection)
-- Leader election within 30 seconds
-- Fault tolerance: Survives (N-1)/2 node failures
-
-### Port 443 Deployment
-
-Running Raft on HTTPS port 443 provides:
-- **Firewall compatibility**: Port 443 always open
-- **No special rules**: Works through corporate firewalls
-- **Multiplexing**: Can share port with HTTP/2 traffic
-- **TLS termination**: Standard HTTPS infrastructure
-
-```go
-cfg.RaftConfig.RaftBindAddr = ":443"  // Use standard HTTPS port
-```
-
-## Best Practices
-
-### Reads
-- ✅ Use `Query()` or `Database()` for read operations
-- ✅ Accept eventual consistency for most reads
-- ✅ High throughput, low latency
-
-### Writes
-- ✅ Always use `Exec()` for write operations
-- ✅ Never use `Database().Exec()` directly
-- ⚠️ Direct writes bypass Raft and corrupt cluster state
-
-### Cluster Sizing
-- **3 nodes**: Tolerates 1 failure (recommended minimum)
-- **5 nodes**: Tolerates 2 failures (production standard)
-- **7+ nodes**: Diminishing returns (slower consensus)
-
-### Monitoring
-```go
-// Check leadership
-if mgr.IsLeader() {
-    metrics.RecordLeadership(true)
-}
-
-// Check cluster health
-peers, _ := mgr.GetPeers()
-leader, _ := mgr.GetLeader()
-log.Printf("Cluster: %d peers, leader=%s", len(peers), leader)
-```
-
-### Error Handling
-```go
-// Write operations may fail due to:
-// - Not leader (redirect to leader)
-// - No quorum (majority nodes unavailable)
-// - Network partition
-err := mgr.Exec(ctx, "hstles", "core", sql, args...)
-if err != nil {
-    if strings.Contains(err.Error(), "not leader") {
-        leader, _ := mgr.GetLeader()
-        // Redirect client to leader
-    }
-    return err
-}
-```
-
-## Troubleshooting
-
-### Connection Issues
-```bash
-# Verify database exists and is accessible
-turso db show core
-
-# Check auth token validity
-curl -H "Authorization: Bearer $TURSO_AUTH_TOKEN" \
-  https://core-hstles.turso.io/v2/pipeline
-```
-
-### Cluster Issues
-```go
-// Check peer connectivity
-peers, _ := mgr.GetPeers()
-log.Printf("Peers: %v", peers)
-
-// Verify leader election
-leader, err := mgr.GetLeader()
-if err != nil {
-    log.Printf("No leader elected: %v", err)
-}
-```
-
-### Performance Issues
-- **Slow writes**: Check network latency between nodes
-- **Slow reads**: Use `Database()` for direct access
-- **High latency**: Reduce `SyncInterval`, optimize Raft transport
-
-## References
-
-- **libraryQL SDK**: https://docs.turso.tech/sdk/go/quickstart
-- **Turso Platform API**: https://docs.turso.tech/api-reference/platform
-- **Raft Consensus**: https://raft.github.io/
-- **Database Groups**: `turso group --help`
-- **Database Management**: `turso db --help`
-
----
-
-**Last Updated**: December 18, 2025  
-**Maintainer**: Update when architecture changes or new features added
+# tursoraft architecture
+
+## Objects
+
+| Object | Where | Authoritative | If lost |
+|---|---|---|---|
+| Primary | libSQL (Turso Cloud or sqld) | Yes | Turso point-in-time recovery |
+| Replica files | `<LocalDir>/replicas/<group>/<db>.db` and companions | No; a cache | Deleted and downloaded again |
+| Local file | `<LocalDir>/local/<group>/<db>.db` | Yes, for its one process | That process's local state |
+| Raft cluster | One per shared database with a raft block, mesh key `tursoraft/<group>/<db>` | Assignments and a cluster ID; no rows | Voters rejoin; if every voter loses state a new cluster forms and an operator runs `fence-adopt` |
+| Raft state | Voters: `<LocalDir>/raft/<group>/<db>/` (BoltDB `logs.db`, `stable.db`, `snapshots/`). Job hosts: memory | — | A voter needs its volume; a host rejoins |
+| Fence row | `_tursoraft_fence(job PK, cluster_id, epoch, node, updated_at)` in the primary | Yes; orders a job's writers | — |
+| Group key | 32 bytes, base64 in the group's config | — | Replica: resync. Local file: unreadable |
+| Member key | HKDF-SHA256(group key, salt `<group>/<db>`, info `tursoraft/member/v1`) | — | Derived; never stored |
+
+## Who is in a cluster
+
+A group's raft block names `voterServices`, `voterCount`, `bootstrapExpect` and
+`jobs{name: [host services]}`. A process takes part when its mesh service is a
+voter service, a host service of any job, or both:
+
+- A **voter** keeps its Raft state on the volume and may vote.
+- A **job host** keeps its Raft state in memory and never votes.
+- Any other process that holds the database has no seat: it writes the
+  database but runs no Raft node for it.
+
+Membership is decided from the service the mesh authenticates, never from what
+a member publishes about itself.
+
+### Member proof
+
+Every Raft stream, in both directions, opens with a proof that the peer holds
+the group key: each side sends a 32-byte nonce, then one HMAC-SHA256 per key
+it holds, under the member key, over
+`"tursoraft-member-v1" ‖ cluster ‖ lower NodeID ‖ higher NodeID ‖ lower nonce ‖ higher nonce ‖ sender NodeID`
+(each field length-prefixed), then the cluster ID it has applied. Both NodeIDs
+come from the mesh (`Conn.RemoteID`), and both nonces are fresh, so a proof
+verifies on no other stream. A peer is accepted when any of its proofs
+verifies under any of this side's keys, so a member configured with a new key
+and the prior one interoperates with a member holding only the prior one.
+Members that have applied different cluster IDs refuse each other.
+
+The leader probes a member with this handshake before adding it, so a process
+with the mesh network key but not the group key never enters a configuration.
+
+### Published metadata
+
+Each member publishes under the cluster key: `role`, `jobs` (the jobs it has
+registered), `state` (`1` once it holds any Raft state), `cluster` (its
+applied cluster ID), `spec` (sha256 of the raft block), `fsmv` (the entry
+version it applies), `idx` (its applied index) and, while it holds no state,
+`boot` (its bootstrap proposal). A member whose `spec`, `fsmv` or `cluster`
+disagrees is ignored and alerted once.
+
+## Bootstrap
+
+A voter with Raft state never bootstraps. A voter with none forms the cluster
+only when:
+
+1. no voter on the mesh advertises `state=1`;
+2. at least `bootstrapExpect` voters with no state and the same `spec` are
+   visible, and this voter is among the `bootstrapExpect` lowest NodeIDs, the
+   proposed set;
+3. every member of the proposed set publishes the same proposal, and has for
+   the settle time (2 s).
+
+The members of the set then call `BootstrapCluster` with the set as voters
+(`ErrCantBootstrap` ignored). The published agreement keeps two voters that see
+different parts of the mesh from bootstrapping two configurations that share a
+first log index and term, which Raft would treat as one log. The first leader
+applies a new random cluster ID. Hosts never bootstrap.
+
+## Reconciler
+
+The leader reconciles every 10 s and whenever the mesh changes (at most every
+100 ms), making at most one membership change per pass:
+
+1. A live participant missing from the configuration is probed, then added as
+   a non-voter.
+2. A non-voter absent for 2 minutes is removed.
+3. A voter absent for 10 minutes is removed only while a caught-up replacement
+   is live and the live voters would still be a quorum. A dead voter left in
+   the configuration counts against every election.
+4. While there are fewer than `voterCount` voters, a caught-up voter-eligible
+   non-voter is promoted, preferring the service furthest below its floor.
+   The floor of a service is 2, or its number of live eligible members when
+   fewer, and applies only when more than one service votes; a service below
+   it gets a voter from a service above it (promote, then demote).
+5. Each job stays with its live holder, else goes to the live member with the
+   lowest NodeID that is in the configuration, hosts the job, and has
+   registered it: `Assign{v:1, job, node}`. The epoch is that entry's log
+   index.
+
+"Live" means publishing under the cluster key with the same spec, entry
+version and cluster ID, and not failing the leader's heartbeats for longer
+than the hold time. "Caught up" means within 1024 entries of the leader.
+
+## Jobs and fencing
+
+The FSM applies entries in memory, takes no lock but its own, and wakes the
+job runner and the control loop through a channel. The runner starts a job's
+body with `Fence{cluster, job, epoch, node}` when the assignment names this
+process, the FSM has not halted, and this process is the leader or heard from
+one within the hold time (2 s); otherwise it cancels the body's context. A
+holder cut off from the leader stops by itself.
+
+`Fence.Tx` runs `BEGIN IMMEDIATE`; upserts the fence row where the cluster ID
+matches and the new epoch is at least the recorded one; requires one affected
+row, else `ErrFenced` (a newer epoch wrote) or `ErrForeignCluster`; runs the
+body; commits. The fence table is created inside the transaction the first
+time it is missing.
+
+## Entry versions
+
+Entries carry `v`. An entry of another version, or of an unknown op, halts the
+member's FSM: it refuses that entry and every later one, stops its jobs and
+alerts. New versions are proposed only when every member advertises them.
+
+## Timing
+
+| Setting | Value | Why |
+|---|---|---|
+| Heartbeat, election timeout | 1 s | A follower with a leader refuses every vote until its own timer (1–2 timeouts) fires; failover follows the slowest follower |
+| Leader lease | 500 ms | A leader cut off from a quorum steps down |
+| Hold | 2 s | A holder without leader contact stops its job |
+| Reconcile | 10 s, and on mesh change | |
+| Host absent / voter absent | 2 min / 10 min | |
+| Settle | 2 s | Bootstrap agreement |
+
+## Shutdown
+
+`Manager.Shutdown`: for each cluster, stop the control, runner and observer
+loops (the control loop may be waiting on a Raft future, and Raft does not
+answer a future whose entry it committed but had not applied when it shut
+down); cancel the jobs and wait for their bodies; withdraw the published
+metadata; hand off leadership; `raft.Shutdown()`; close the BoltDB stores;
+close the transport, which closes every stream. Then stop each replica's sync
+loop and close its pool, which closes the connector, and close local files.
+
+## Failure modes
+
+| Situation | What happens | Recovery |
+|---|---|---|
+| Primary unreachable at boot | Replica open retries for 60 s, then `NewManager` fails | Next start |
+| Primary unreachable while running | Pulls fail; writes fail; pooled reads fail too (the foreign-key proof on each reuse needs the primary); fenced jobs fail their transactions | Pulls and writes recover on their own |
+| Raft leader lost | New leader in about 1–2 s; jobs of a dead holder reassigned | Automatic |
+| Stale job holder | Its next `Fence.Tx` affects no row: `ErrFenced` | Automatic |
+| A quorum of voters lost | No leader; jobs stop; `Database()` unaffected | Restore voters |
+| Every voter loses state | New cluster ID; `Fence.Tx` returns `ErrForeignCluster` | `tursoraft-admin fence-adopt` |
+| Entry of an unknown version | Member halts and alerts | Upgrade the member |
+| Peer without the group key | Member proof fails; stream closed; never added | — |
+| Plaintext replica file under a key | Deleted at boot and downloaded again | Automatic |
+| Replica under another key | Open fails ("file is not a database") | Fix the key or delete the replica |
+| Transaction held about 5 s | Primary rolls it back | Smaller steps |
+| Read then write outside a transaction | Lost update | One `BeginTx` or one statement |
+| Shared group in a build without cgo | `ErrReplicaNeedsCGO` | Build with cgo |
