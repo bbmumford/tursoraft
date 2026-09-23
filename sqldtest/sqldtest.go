@@ -3,11 +3,11 @@
 // the test's temporary directory. Only the process it started is ever
 // stopped.
 //
-// Consumed by every tursoraft test that needs a primary, and by tests in
-// other modules that run tursoraft against one, such as a mesh runtime's
-// cluster test. It sits outside internal/ for those modules: they then pick
-// the binary, wait for readiness and stop the process the same way, instead
-// of each keeping its own sqld launcher.
+// Consumed by every tursoraft test that needs a primary. It sits outside
+// internal/ so that a test in another module that runs tursoraft against a
+// primary, such as a mesh runtime's cluster test, can pick the binary, wait
+// for readiness and stop the process the same way instead of keeping its own
+// sqld launcher.
 //
 // The binary is $TURSORAFT_SQLD, else /opt/homebrew/bin/sqld, else sqld on
 // PATH; with none the test is skipped.

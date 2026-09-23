@@ -269,9 +269,10 @@ func TestOutageWritesFailAndRecover(t *testing.T) {
 // replica file: every 100 ms, PoolSize connections proved before the outage
 // each serve a read at once, and each read sees every row. Writes fail
 // meanwhile, and a failed write costs the pool no proved connection. Once the
-// primary is back a write succeeds and a later read sees it, and a write that
-// would orphan a row is refused, though no connection proved foreign keys
-// again on the primary's new session.
+// primary is back a write succeeds and a later read sees it, and on each of
+// PoolSize connections held at once a write that would orphan a row fails its
+// foreign-key check, though none of them proved foreign keys again on the
+// primary's new session.
 func TestOutageServesReads(t *testing.T) {
 	s := sqldtest.Start(t)
 	r := openReplica(t, s, filepath.Join(t.TempDir(), "reads.db"), newKey(t))
@@ -364,8 +365,12 @@ func TestOutageServesReads(t *testing.T) {
 	if n := count(t, r, "p"); n != 4 {
 		t.Errorf("after recovery the replica reads %d rows, want 4", n)
 	}
-	if _, err := db.ExecContext(ctx, "INSERT INTO c VALUES (1, 99)"); err == nil {
-		t.Error("an orphan row was written after the primary restarted: its new session does not enforce foreign keys")
+	conns := hold()
+	for i, c := range conns {
+		if _, err := c.ExecContext(ctx, "INSERT INTO c VALUES (?, 99)", i+1); err == nil || !strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			t.Errorf("connection %d of %d after the restart: an orphan write got %v, want a foreign-key failure", i+1, len(conns), err)
+		}
 	}
+	release(conns)
 	mustExec(t, r, "INSERT INTO c VALUES (1, 4)")
 }
