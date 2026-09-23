@@ -1,0 +1,455 @@
+// Package replica keeps an encrypted embedded replica of one shared database.
+//
+// Reads are answered from the local replica file; every write is sent to the
+// primary before the call returns, so the primary alone orders writes from
+// every process holding the database. A sync loop pulls the primary's newer
+// frames into the file.
+//
+// The pool proves foreign keys on every new connection and on every reuse
+// (policypool), and the engine sends PRAGMA foreign_keys to the primary like
+// a write. So every pooled statement, reads included, costs one round trip to
+// the primary and fails while the primary is unreachable;
+// TestPolicyProofReachesThePrimary measures it.
+//
+// Consumed by the Manager for every database of a shared group, and by
+// connectors.MakeConnector given a primary URL. The replica file is a cache:
+// deleting it costs one download, which is why a plaintext file found under a
+// configured key is deleted rather than refused.
+package replica
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bbmumford/policypool"
+
+	"github.com/bbmumford/tursoraft/database"
+	"github.com/bbmumford/tursoraft/localdb"
+)
+
+// Defaults and bounds.
+const (
+	// DefaultSyncInterval is how often the loop pulls when Config gives none.
+	DefaultSyncInterval = 5 * time.Second
+	// DefaultOpenTimeout is how long Open keeps retrying an unreachable
+	// primary when Config gives no bound.
+	DefaultOpenTimeout = 60 * time.Second
+	// SyncGap is the least time between the starts of two pulls requested
+	// through Sync. A session store asks for a pull on every unknown cookie,
+	// and cookies arrive faster than a pull completes; the gap bounds the
+	// pulls to four a second however many requests arrive.
+	SyncGap = 250 * time.Millisecond
+	// closeWait is how long Close waits for a pull in progress. The native
+	// pull takes no context, so one against a primary that stopped answering
+	// may outlast it.
+	closeWait = 10 * time.Second
+	// staleAfter is how many sync intervals without a successful pull make a
+	// replica stale.
+	staleAfter = 3
+)
+
+// Errors.
+var (
+	// ErrReplicaNeedsCGO is what Open returns in a build without cgo: the
+	// replica engine is a C library.
+	ErrReplicaNeedsCGO = errors.New("tursoraft/replica: an embedded replica needs a cgo build")
+	// ErrKeyLength means the key is not exactly 32 bytes.
+	ErrKeyLength = errors.New("tursoraft/replica: key must be exactly 32 bytes")
+	// ErrNoURL means Config has no primary URL.
+	ErrNoURL = errors.New("tursoraft/replica: primary url is empty")
+	// ErrRelativePath means the replica path is not absolute.
+	ErrRelativePath = errors.New("tursoraft/replica: path must be absolute")
+	// ErrClosed is what Sync returns once Close has begun.
+	ErrClosed = errors.New("tursoraft/replica: closed")
+	// ErrCloseTimedOut means Close returned while a pull was still inside the
+	// native library. The pool closes when that pull returns.
+	ErrCloseTimedOut = errors.New("tursoraft/replica: a pull in progress outlasted close; the pool closes when it returns")
+)
+
+// Config describes one replica.
+type Config struct {
+	// Path is the replica file, absolute.
+	Path string
+	// URL is the primary, for example libsql://<db>-<org>.turso.io.
+	URL string
+	// AuthToken reaches the primary. Empty sends no token, which only a
+	// primary with authentication off accepts.
+	AuthToken string
+	// Key encrypts the replica file and its WAL; exactly 32 bytes.
+	Key []byte
+	// SyncInterval is the pull period; zero means DefaultSyncInterval.
+	SyncInterval time.Duration
+	// OpenTimeout bounds Open's retries; zero means DefaultOpenTimeout.
+	OpenTimeout time.Duration
+	// Logger receives plaintext deletions, retries and sync failures; nil
+	// means slog.Default.
+	Logger *slog.Logger
+}
+
+// Stats is one replica's sync state.
+type Stats struct {
+	// Frame is the replica's frame number after the last successful pull.
+	Frame uint64
+	// LastPull is the time of the last successful pull, including the one
+	// Open made.
+	LastPull time.Time
+	// Stale means no pull has succeeded for three sync intervals.
+	Stale bool
+	// Err is the last pull's error, nil when it succeeded.
+	Err error
+}
+
+// SyncStats maps s onto the shape database.SyncStats keeps.
+func (s Stats) SyncStats() database.SyncStats {
+	var pulled int64
+	if !s.LastPull.IsZero() {
+		pulled = s.LastPull.Unix()
+	}
+	return database.SyncStats{LastPullUnixTime: pulled, Revision: strconv.FormatUint(s.Frame, 10)}
+}
+
+// native is the replica engine's connector as this package drives it.
+type native interface {
+	driver.Connector
+	Close() error
+	// Sync pulls from the primary and returns the frame number reached. It
+	// takes no context and may block for as long as the primary does.
+	Sync() (uint64, error)
+}
+
+// openNative opens the engine's connector. The cgo build sets it; tests
+// replace it.
+var openNative = openEngine
+
+// Replica is one open replica.
+type Replica struct {
+	cfg      Config
+	log      *slog.Logger
+	interval time.Duration
+	native   native
+	db       *sql.DB
+
+	reqs chan chan error
+	stop chan struct{}
+	done chan struct{}
+
+	closeOnce sync.Once
+	closeErr  error
+
+	mu       sync.Mutex
+	frame    uint64
+	lastPull time.Time
+	lastErr  error
+}
+
+// Open validates cfg, deletes a plaintext replica file, opens the replica,
+// retrying an unreachable primary until the open timeout, wraps it in a pool
+// on which every connection has foreign keys on, and starts the sync loop.
+//
+// There is no fallback: a primary that stays unreachable fails Open, because
+// a server that served from a replica it could not open would answer from
+// nothing.
+func Open(ctx context.Context, cfg Config) (*Replica, error) {
+	if !Supported {
+		return nil, ErrReplicaNeedsCGO
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
+		return nil, fmt.Errorf("tursoraft/replica: %w", err)
+	}
+	if err := removePlaintext(cfg.Path, log); err != nil {
+		return nil, err
+	}
+	n, err := openRetrying(ctx, cfg, log)
+	if err != nil {
+		return nil, err
+	}
+	db, err := policypool.OpenConnector(ctx, n, policypool.ForeignKeysRequired)
+	if err != nil {
+		n.Close()
+		return nil, fmt.Errorf("tursoraft/replica: pool for %s: %w", cfg.Path, err)
+	}
+	r := &Replica{
+		cfg: cfg, log: log, interval: cfg.syncInterval(), native: n, db: db,
+		reqs: make(chan chan error),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+		// The engine pulled once inside the open.
+		lastPull: time.Now(),
+	}
+	go r.loop()
+	return r, nil
+}
+
+func (c Config) validate() error {
+	if c.Path == "" || !filepath.IsAbs(c.Path) {
+		return fmt.Errorf("%w: %q", ErrRelativePath, c.Path)
+	}
+	if c.URL == "" {
+		return ErrNoURL
+	}
+	if len(c.Key) != 32 {
+		return ErrKeyLength
+	}
+	return nil
+}
+
+func (c Config) syncInterval() time.Duration {
+	if c.SyncInterval > 0 {
+		return c.SyncInterval
+	}
+	return DefaultSyncInterval
+}
+
+// replicaFiles are the suffixes of every file the engine keeps beside a
+// replica: the database, its WAL and shared-memory index, and the replication
+// state the engine records for the pull.
+var replicaFiles = []string{"", "-wal", "-shm", "-client_wal_index", "-info"}
+
+// removePlaintext deletes the replica and its companion files when the
+// database file begins with the plaintext SQLite header. The engine would
+// otherwise open it unencrypted, or fail on it, under a configured key.
+func removePlaintext(path string, log *slog.Logger) error {
+	plain, err := localdb.IsPlaintext(path)
+	if err != nil {
+		return fmt.Errorf("tursoraft/replica: check %s: %w", path, err)
+	}
+	if !plain {
+		return nil
+	}
+	for _, suffix := range replicaFiles {
+		if err := os.Remove(path + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("tursoraft/replica: remove plaintext replica: %w", err)
+		}
+	}
+	log.Warn("tursoraft: deleted a plaintext replica found under a configured key; it downloads again", "path", path)
+	return nil
+}
+
+// openRetrying opens the engine's connector until it succeeds, fails with an
+// error no retry can change, or the open timeout passes.
+func openRetrying(ctx context.Context, cfg Config, log *slog.Logger) (native, error) {
+	timeout := cfg.OpenTimeout
+	if timeout <= 0 {
+		timeout = DefaultOpenTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	backoff := 250 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		n, err := openDetached(ctx, cfg)
+		if err == nil {
+			return n, nil
+		}
+		if permanent(err) {
+			return nil, fmt.Errorf("tursoraft/replica: open %s: %w", cfg.Path, err)
+		}
+		log.Warn("tursoraft: replica open failed; retrying", "path", cfg.Path, "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("tursoraft/replica: open %s: primary unreachable for %v: %w", cfg.Path, timeout, err)
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, 2*time.Second)
+	}
+}
+
+// openDetached runs the native open, which takes no context and blocks on the
+// first pull, and stops waiting when ctx ends. An open that completes after
+// that is closed as soon as it returns.
+func openDetached(ctx context.Context, cfg Config) (native, error) {
+	type result struct {
+		n   native
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := openNative(cfg)
+		ch <- result{n, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-ctx.Done():
+		go func() {
+			if res := <-ch; res.n != nil {
+				res.n.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
+// permanentText are the engine's messages for failures a retry cannot change:
+// a file under another key, and a refused credential.
+var permanentText = []string{
+	"not a database",
+	"decrypt",
+	"unauthorized",
+	"status=401",
+	"permissiondenied",
+	"not authorized",
+}
+
+func permanent(err error) bool {
+	text := strings.ToLower(err.Error())
+	for _, p := range permanentText {
+		if strings.Contains(text, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// DB returns the replica's pool. Every connection on it has foreign keys on
+// and opens write transactions with BEGIN IMMEDIATE.
+func (r *Replica) DB() *sql.DB { return r.db }
+
+// Stats reports the replica's sync state.
+func (r *Replica) Stats() Stats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return Stats{
+		Frame:    r.frame,
+		LastPull: r.lastPull,
+		Stale:    time.Since(r.lastPull) > staleAfter*r.interval,
+		Err:      r.lastErr,
+	}
+}
+
+// SyncStats is Stats in the shape database.SyncStats keeps.
+func (r *Replica) SyncStats() database.SyncStats { return r.Stats().SyncStats() }
+
+// Sync pulls from the primary and returns when a pull that started after this
+// call has finished, or ctx ends.
+//
+// Every pull runs on the sync loop, one at a time: callers waiting together
+// share one pull, and a pull starts no sooner than SyncGap after the last one
+// started. A caller whose ctx ends stops waiting; the pull still completes.
+func (r *Replica) Sync(ctx context.Context) error {
+	w := make(chan error, 1)
+	select {
+	case r.reqs <- w:
+	case <-r.done:
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-w:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// loop runs every pull: one per sync interval, jittered, and one for each
+// batch of Sync callers. It is the only goroutine that calls the native pull,
+// so no pull runs concurrently with another or with the connector's close.
+func (r *Replica) loop() {
+	defer close(r.done)
+	next := time.NewTimer(0)
+	defer next.Stop()
+	var gap <-chan time.Time
+	var waiting []chan error
+	var lastStart time.Time
+	for {
+		due := false
+		select {
+		case <-r.stop:
+			for _, w := range waiting {
+				w <- ErrClosed
+			}
+			return
+		case w := <-r.reqs:
+			waiting = append(waiting, w)
+		case <-next.C:
+			due = true
+		case <-gap:
+			gap = nil
+		}
+		if !due && len(waiting) > 0 {
+			if wait := SyncGap - time.Since(lastStart); wait > 0 {
+				if gap == nil {
+					gap = time.After(wait)
+				}
+				continue
+			}
+			due = true
+		}
+		if !due {
+			continue
+		}
+		batch := waiting
+		waiting = nil
+		lastStart = time.Now()
+		err := r.pull()
+		for _, w := range batch {
+			w <- err
+		}
+		next.Reset(r.jittered())
+	}
+}
+
+// jittered spreads the pulls of every process holding the database across
+// ±20% of the interval.
+func (r *Replica) jittered() time.Duration {
+	span := r.interval / 5
+	return r.interval - span + time.Duration(rand.Int64N(int64(2*span)+1))
+}
+
+func (r *Replica) pull() error {
+	frame, err := r.native.Sync()
+	r.mu.Lock()
+	failing := r.lastErr != nil
+	if err == nil {
+		r.frame, r.lastPull, r.lastErr = frame, time.Now(), nil
+	} else {
+		r.lastErr = err
+	}
+	r.mu.Unlock()
+	switch {
+	case err != nil && !failing:
+		r.log.Warn("tursoraft: replica pull failed; writes fail until the primary answers", "path", r.cfg.Path, "err", err)
+	case err == nil && failing:
+		r.log.Info("tursoraft: replica pull recovered", "path", r.cfg.Path, "frame", frame)
+	}
+	return err
+}
+
+// Close stops the sync loop and then closes the pool, which closes the
+// connector. The order matters: closing the connector while a pull runs on it
+// frees memory the pull is using.
+func (r *Replica) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.stop)
+		select {
+		case <-r.done:
+			r.closeErr = r.db.Close()
+		case <-time.After(closeWait):
+			go func() {
+				<-r.done
+				r.db.Close()
+			}()
+			r.closeErr = ErrCloseTimedOut
+		}
+	})
+	return r.closeErr
+}

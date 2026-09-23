@@ -1,7 +1,13 @@
-// Example: Basic TursoRaft distributed database cluster
+// Command basic opens one shared database as an encrypted embedded replica
+// and one local file, writes and reads both, and shuts down.
 //
-// This demonstrates setting up a distributed Turso/libraryQL cluster with
-// Raft consensus for strong consistency across nodes.
+//	TURSORAFT_URL=libsql://orbtr-sessions-orbtr.turso.io \
+//	TURSORAFT_TOKEN=<database token> \
+//	TURSORAFT_KEY=$(head -c32 /dev/urandom | base64) \
+//	go run ./examples/basic
+//
+// The url and a database-scoped token come from tursoraft-admin ensure and
+// tursoraft-admin token. The key is the group's 32-byte key, base64.
 package main
 
 import (
@@ -9,77 +15,70 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/bbmumford/tursoraft/manager"
 )
 
 func main() {
-	// Create configuration using the manager.ManagerConfig type
+	dir, err := filepath.Abs("tursoraft-example")
+	if err != nil {
+		log.Fatal(err)
+	}
+	key := os.Getenv("TURSORAFT_KEY")
 	cfg := manager.ManagerConfig{
-		TursoConfig: manager.TursoConfig{
-			APIToken: os.Getenv("TURSO_API_TOKEN"),
-			OrgName:  os.Getenv("TURSO_ORG_NAME"),
-		},
 		Groups: []manager.GroupConfig{
 			{
-				GroupName: "primary",
-				AuthToken: os.Getenv("TURSO_DB_TOKEN"),
-				DBNames:   []string{"users", "sessions"},
+				GroupName:     "sessions",
+				DBNames:       []string{"orbtr-sessions"},
+				EncryptionKey: key,
+				Databases: []manager.DatabaseConfig{{
+					Name: "orbtr-sessions", URL: os.Getenv("TURSORAFT_URL"), AuthToken: os.Getenv("TURSORAFT_TOKEN"),
+				}},
 			},
+			{GroupName: "local", DBNames: []string{"cache"}, PureLocal: true, EncryptionKey: key},
 		},
-		RaftConfig: manager.RaftConfig{
-			LocalDir:     "./data/tursoraft",
-			SnapshotDir:  "./data/tursoraft/snapshots",
-			RaftBindAddr: ":8300",
-		},
-		PeerEnvVar:   "TURSORAFT_PEERS",
-		SyncInterval: 5 * time.Minute,
-		SnapMinGap:   2 * time.Minute,
+		RaftConfig:   manager.RaftConfig{LocalDir: dir},
+		SyncInterval: 5 * time.Second,
 	}
-
-	// Validate configuration
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("invalid config: %v", err)
+		log.Fatalf("config: %v", err)
 	}
-
-	// Create and start manager
 	ctx := context.Background()
 	mgr, err := manager.NewManager(ctx, cfg)
 	if err != nil {
-		log.Fatalf("failed to create manager: %v", err)
+		log.Fatalf("open: %v", err)
 	}
 	defer mgr.Shutdown()
 
-	// Get database handle using the Database method
-	db, err := mgr.Database("primary", "users")
+	db, err := mgr.Database("sessions", "orbtr-sessions")
 	if err != nil {
-		log.Fatalf("failed to get database: %v", err)
+		log.Fatal(err)
 	}
-
-	// Query using the sql.DB handle
-	rows, err := db.Query("SELECT id, name FROM users LIMIT 10")
+	// Idempotent schema: every instance applies it at boot.
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS visits(id INTEGER PRIMARY KEY, at TEXT NOT NULL)`); err != nil {
+		log.Fatal(err)
+	}
+	// The write reaches the primary before it returns.
+	if _, err := db.ExecContext(ctx, `INSERT INTO visits(at) VALUES (?)`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		log.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM visits`).Scan(&n); err != nil {
+		log.Fatal(err)
+	}
+	h, err := mgr.Health("sessions", "orbtr-sessions")
 	if err != nil {
-		log.Fatalf("query failed: %v", err)
+		log.Fatal(err)
 	}
-	defer rows.Close()
+	fmt.Printf("visits: %d (replica frame %d, last pull %s)\n", n, h.Frame, h.LastPull.Format(time.RFC3339))
 
-	fmt.Println("Users:")
-	for rows.Next() {
-		var id int
-		var name string
-		rows.Scan(&id, &name)
-		fmt.Printf("  %d: %s\n", id, name)
-	}
-
-	// Check if this node is the leader
-	if mgr.IsLeader() {
-		fmt.Println("This node is the Raft leader")
-	}
-
-	// Alternative: Use Exec/Query methods with group/db routing
-	err = mgr.Exec(ctx, "primary", "sessions", "DELETE FROM sessions WHERE expired_at < ?", time.Now().Unix())
+	local, err := mgr.Database("local", "cache")
 	if err != nil {
-		log.Printf("cleanup failed: %v", err)
+		log.Fatal(err)
+	}
+	if _, err := local.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)`); err != nil {
+		log.Fatal(err)
 	}
 }
