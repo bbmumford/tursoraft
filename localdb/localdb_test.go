@@ -134,7 +134,9 @@ func TestEncryptionNeedsTheExperimentalFlag(t *testing.T) {
 // local file is the only copy of its rows.
 func TestPlaintextFileIsRefusedAndKept(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "plain.db")
-	plain, err := localdb.OpenPlaintext(context.Background(), path)
+	// "turso" is the tursogo driver this package registers; with no key in
+	// the name it writes a plaintext SQLite file.
+	plain, err := sql.Open("turso", path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,6 +144,9 @@ func TestPlaintextFileIsRefusedAndKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain.Close()
+	if ok, _ := localdb.IsPlaintext(path); !ok {
+		t.Fatal("setup: the file is not plaintext")
+	}
 	_, err = localdb.Open(context.Background(), path, key(t))
 	if !errors.Is(err, localdb.ErrPlaintext) {
 		t.Fatalf("got %v, want ErrPlaintext", err)

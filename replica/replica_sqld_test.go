@@ -106,7 +106,9 @@ func TestPlaintextReplicaIsReplaced(t *testing.T) {
 	s := sqldtest.Start(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "plain.db")
-	plain, err := localdb.OpenPlaintext(context.Background(), path)
+	// "turso" is the tursogo driver localdb registers; with no key in the name
+	// it writes a plaintext SQLite file.
+	plain, err := sql.Open("turso", path)
 	if err != nil {
 		t.Fatal(err)
 	}

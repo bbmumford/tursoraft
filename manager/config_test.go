@@ -115,17 +115,3 @@ func TestAHostThatDoesNotVoteNeedsNoVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-
-// The fields loom's node runtime sets and a Manager ignores are accepted.
-func TestIgnoredFieldsAreAccepted(t *testing.T) {
-	cfg := ManagerConfig{
-		Groups:      []GroupConfig{{GroupName: "mesh", DBNames: []string{"lad"}, PureLocal: true, EncryptionKey: b64Key()}},
-		RaftConfig:  RaftConfig{LocalDir: t.TempDir(), RaftBindAddr: ":7331", SnapshotDir: "/x"},
-		TursoConfig: TursoConfig{APIToken: "org-token", OrgName: "orbtr"},
-		PeerEnvVar:  "MESHDB_PEERS",
-		UseEmbedded: true,
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
-}

@@ -60,25 +60,6 @@ type ManagerConfig struct {
 	// Logger receives the manager's alerts; nil means slog.Default.
 	Logger *slog.Logger `json:"-"`
 
-	// TursoConfig is ignored: a Manager opens every shared database from its
-	// url and token and never calls the platform API.
-	//
-	// Deprecated: ignored; loom's node runtime fills it.
-	TursoConfig TursoConfig `json:"tursoConfig"`
-	// PeerEnvVar is ignored: members find each other on the mesh.
-	//
-	// Deprecated: ignored; loom's mesh ledger sets it.
-	PeerEnvVar string `json:"peerEnvVar"`
-	// SnapMinGap is ignored: Raft snapshots hold assignments, not rows.
-	//
-	// Deprecated: ignored; loom's node runtime sets it.
-	SnapMinGap time.Duration `json:"snapMinGap"`
-	// UseEmbedded is ignored: every shared database is an embedded replica
-	// and every pureLocal database a local file.
-	//
-	// Deprecated: ignored; loom's node runtime sets it.
-	UseEmbedded bool `json:"useEmbedded"`
-
 	// timing overrides the cluster timing; tests shorten it.
 	timing cluster.Timing
 }
@@ -88,24 +69,6 @@ type RaftConfig struct {
 	// LocalDir is the absolute directory for replicas, local files and Raft
 	// state.
 	LocalDir string `json:"localDir"`
-	// RaftBindAddr is ignored: Raft runs over ManagerConfig.Mesh.
-	//
-	// Deprecated: ignored; loom's node runtime sets it.
-	RaftBindAddr string `json:"raftBindAddr"`
-	// SnapshotDir is ignored: Raft snapshots sit under LocalDir.
-	//
-	// Deprecated: ignored; loom's node runtime sets it.
-	SnapshotDir string `json:"snapshotDir"`
-}
-
-// TursoConfig is the platform account. A Manager never reads it; the
-// tursoraft-admin command uses its own flags.
-//
-// Deprecated: ignored; loom's node runtime fills ManagerConfig.TursoConfig.
-type TursoConfig struct {
-	APIToken string `json:"apiToken"`
-	OrgName  string `json:"orgName"`
-	BaseURL  string `json:"baseUrl"`
 }
 
 // GroupConfig is one database group.

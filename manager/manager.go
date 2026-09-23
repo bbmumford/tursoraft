@@ -82,7 +82,6 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	if m.log == nil {
 		m.log = slog.Default()
 	}
-	m.warnIgnored()
 	for _, g := range cfg.Groups {
 		if err := m.openGroup(ctx, g); err != nil {
 			m.Shutdown()
@@ -99,15 +98,6 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 		}
 	}
 	return m, nil
-}
-
-// warnIgnored logs the ignored fields a caller set, so an operator reading the
-// log sees that Raft does not listen on a port.
-func (m *Manager) warnIgnored() {
-	c := m.cfg
-	if c.RaftConfig.RaftBindAddr != "" || c.PeerEnvVar != "" || c.TursoConfig.APIToken != "" {
-		m.log.Warn("tursoraft: raftBindAddr, peerEnvVar and the platform API token are ignored; raft runs over the mesh and databases open from their url and token")
-	}
 }
 
 func (m *Manager) openGroup(ctx context.Context, g GroupConfig) error {
