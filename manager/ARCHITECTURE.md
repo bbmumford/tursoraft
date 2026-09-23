@@ -146,7 +146,7 @@ loop and close its pool, which closes the connector, and close local files.
 | Situation | What happens | Recovery |
 |---|---|---|
 | Primary unreachable at boot | Replica open retries for 60 s, then `NewManager` fails | Next start |
-| Primary unreachable while running | Pulls fail; writes fail; pooled reads fail too (the foreign-key proof on each reuse needs the primary); fenced jobs fail their transactions | Pulls and writes recover on their own |
+| Primary unreachable while running | Pulls fail; writes fail; fenced jobs fail their transactions. Reads are served from the replica file on the connections the pool proved before the outage, up to `replica.PoolSize` at once; a new connection fails its foreign-key proof, which needs the primary | Pulls and writes recover on their own |
 | Raft leader lost | New leader in about 1–2 s; jobs of a dead holder reassigned | Automatic |
 | Stale job holder | Its next `Fence.Tx` affects no row: `ErrFenced` | Automatic |
 | A quorum of voters lost | No leader; jobs stop; `Database()` unaffected | Restore voters |

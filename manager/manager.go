@@ -4,12 +4,14 @@
 // Every process that holds a shared database keeps an encrypted embedded
 // replica of its primary: reads are answered from the replica file, and each
 // write reaches the primary before it returns, so every holder writes and
-// none waits for Raft. Every pooled connection also proves foreign keys on
-// each reuse, and the replica engine sends that proof to the primary (see the
-// replica package). A group with a raft block also gets one Raft cluster, run over the
-// mesh, that assigns each declared job to one live host and stamps the
-// assignment with an epoch; the job's writes go through fence.Fence.Tx, which
-// the primary orders by that epoch. Raft carries assignments only, never rows.
+// none waits for Raft. A replica's pooled connection proves foreign keys once,
+// when it opens, which needs the primary, so reads on the connections already
+// open keep answering while the primary is down (see the replica package).
+//
+// A group with a raft block also gets one Raft cluster, run over the mesh,
+// that assigns each declared job to one live host and stamps the assignment
+// with an epoch; the job's writes go through fence.Fence.Tx, which the
+// primary orders by that epoch. Raft carries assignments only, never rows.
 //
 // The package is neutral: the mesh is an interface (package mesh) that a mesh
 // runtime implements, and nothing here reads an environment variable or calls
@@ -198,10 +200,10 @@ func (m *Manager) holding(group, db string) (*holding, error) {
 }
 
 // Database returns the pool of one database. Every connection on it has
-// foreign keys on; on a shared database every transaction that can write
-// begins with BEGIN IMMEDIATE on the primary, and every statement needs the
-// primary to answer, because the foreign-key proof on each connection reuse
-// is sent there.
+// foreign keys on. On a shared database every transaction that can write
+// begins with BEGIN IMMEDIATE on the primary, every write needs the primary,
+// and reads are answered from the replica file, also while the primary is
+// down, on the connections the pool proved before.
 //
 // A read and then a write outside one transaction can lose an update another
 // process makes between them; put both in one BeginTx, or in one statement.

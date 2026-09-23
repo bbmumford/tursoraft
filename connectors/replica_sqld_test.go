@@ -6,15 +6,16 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"path/filepath"
 	"testing"
 
-	"github.com/bbmumford/tursoraft/internal/sqldtest"
+	"github.com/bbmumford/tursoraft/sqldtest"
 )
 
 // With a primary URL MakeConnector opens an encrypted replica whose handle
 // syncs and reports replica stats; closing the handle stops the replica
-// before the pool.
+// before the pool. With no key it opens nothing.
 func TestPrimaryURLOpensAReplica(t *testing.T) {
 	s := sqldtest.Start(t)
 	k := make([]byte, 32)
@@ -36,7 +37,7 @@ func TestPrimaryURLOpensAReplica(t *testing.T) {
 	if err := h.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MakeConnector(filepath.Join(t.TempDir(), "n.db"), s.URL(), "db-token", ""); err == nil {
-		t.Error("a replica opened with no key")
+	if _, err := MakeConnector(filepath.Join(t.TempDir(), "n.db"), s.URL(), "db-token", ""); !errors.Is(err, ErrNoKey) {
+		t.Errorf("a replica with no key: got %v, want ErrNoKey", err)
 	}
 }

@@ -15,8 +15,8 @@ import (
 
 	"github.com/bbmumford/tursoraft/fence"
 	"github.com/bbmumford/tursoraft/internal/cluster"
-	"github.com/bbmumford/tursoraft/internal/sqldtest"
 	"github.com/bbmumford/tursoraft/mesh/meshtest"
+	"github.com/bbmumford/tursoraft/sqldtest"
 )
 
 func testTiming() cluster.Timing {
@@ -272,6 +272,45 @@ func TestGroupRaftWithDatabaseLogs(t *testing.T) {
 	if err != nil || h.ClusterID == "" || len(h.HeldJobs) != 1 {
 		t.Errorf("health %+v, %v", h, err)
 	}
+}
+
+// MeshKey is the key the cluster runs under: once the manager is up, its
+// member is listed under MeshKey of its database and the cluster holds that
+// key's listener, while the key of another database lists nobody and is free
+// to listen on.
+func TestMeshKeyIsTheKeyTheClusterRunsUnder(t *testing.T) {
+	s := sqldtest.Start(t)
+	hub := meshtest.NewHub()
+	spec := &RaftSpec{VoterServices: []string{"node.orbtr.ai"}, VoterCount: 1, BootstrapExpect: 1,
+		Jobs: map[string][]string{"sweep": {"node.orbtr.ai"}}}
+	m, n := startNode(t, hub, "n1", "control", "orbtr-control", s.URL(), b64Key(), spec)
+	defer n.Close()
+	defer m.Shutdown()
+
+	key := MeshKey("control", "orbtr-control")
+	for deadline := time.Now().Add(10 * time.Second); len(n.Members(key)) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("no member is published under MeshKey %q", key)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := n.Members(key); len(got) != 1 || got[0].NodeID != "n1" {
+		t.Errorf("members under %q: %+v, want n1 alone", key, got)
+	}
+	if ln, err := n.Listen(key); err == nil {
+		ln.Close()
+		t.Errorf("MeshKey %q was free to listen on: the cluster does not listen under it", key)
+	}
+
+	other := MeshKey("control", "other")
+	if got := n.Members(other); len(got) != 0 {
+		t.Errorf("members under another database's key %q: %+v", other, got)
+	}
+	ln, err := n.Listen(other)
+	if err != nil {
+		t.Fatalf("another database's key %q is already listened on: %v", other, err)
+	}
+	ln.Close()
 }
 
 // A process whose service neither votes nor hosts a job holds the database

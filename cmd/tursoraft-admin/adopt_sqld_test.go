@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/bbmumford/tursoraft/fence"
-	"github.com/bbmumford/tursoraft/internal/sqldtest"
 	"github.com/bbmumford/tursoraft/replica"
+	"github.com/bbmumford/tursoraft/sqldtest"
 )
 
 // Against a real primary: rows fenced by a lost cluster refuse the new

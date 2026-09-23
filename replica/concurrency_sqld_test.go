@@ -10,8 +10,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bbmumford/tursoraft/internal/sqldtest"
 	"github.com/bbmumford/tursoraft/replica"
+	"github.com/bbmumford/tursoraft/sqldtest"
 )
 
 // twoReplicas opens two replicas of one primary, as two processes holding

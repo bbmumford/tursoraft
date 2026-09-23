@@ -70,9 +70,12 @@ func Open(ctx context.Context, path string, key []byte) (*sql.DB, error) {
 
 // OpenPlaintext opens the file at path unencrypted.
 //
-// Its one caller is connectors.MakeConnector given no key, which loom's node
-// runtime relies on for its LAD file.
-// TODO: delete once that caller passes a key.
+// Consumed only by tests that need a plaintext file to prove it is refused or
+// replaced: this package's, the replica package's, and loom's test that a LAD
+// file its node cannot read is replaced. No production path opens a database
+// without a key.
+// TODO: delete once those fixtures create the file through the "turso" driver
+// directly.
 func OpenPlaintext(ctx context.Context, path string) (*sql.DB, error) {
 	if err := prepare(path); err != nil {
 		return nil, err

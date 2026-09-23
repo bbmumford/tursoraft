@@ -5,11 +5,22 @@
 // every process holding the database. A sync loop pulls the primary's newer
 // frames into the file.
 //
-// The pool proves foreign keys on every new connection and on every reuse
-// (policypool), and the engine sends PRAGMA foreign_keys to the primary like
-// a write. So every pooled statement, reads included, costs one round trip to
-// the primary and fails while the primary is unreachable;
-// TestPolicyProofReachesThePrimary measures it.
+// The pool proves foreign keys on each physical connection when it opens, and
+// refuses every statement that would turn them off, for the connection's whole
+// life (policypool.ForeignKeysRequiredAtConnect). It does not prove them again
+// when a connection is reused: the engine sends PRAGMA foreign_keys to the
+// primary, so a proof on every reuse would cost each pooled statement a round
+// trip to the primary and fail every pooled read while the primary is
+// unreachable (TestPolicyProofReachesThePrimary measures both). The setting
+// cannot lapse between proofs: a write runs on the primary under the
+// connection's setting, a session the libSQL primary starts again begins with
+// foreign keys on, and the guard refuses the one statement that turns them
+// off.
+//
+// A physical connection opened while the primary is unreachable fails its
+// proof, so reads during an outage are served by the connections proved
+// before it: the pool keeps up to PoolSize of them idle and retires none for
+// age.
 //
 // Consumed by the Manager for every database of a shared group, and by
 // connectors.MakeConnector given a primary URL. The replica file is a cache:
@@ -57,6 +68,13 @@ const (
 	// staleAfter is how many sync intervals without a successful pull make a
 	// replica stale.
 	staleAfter = 3
+	// PoolSize is how many proved connections the pool keeps idle, and so how
+	// many reads an outage serves at once: a read that needs one more opens a
+	// connection whose proof needs the primary, and fails. database/sql keeps
+	// two by default. Open connections are not capped, because a write holds
+	// its connection for a round trip to the primary, and a cap would make the
+	// process's reads wait behind PoolSize writes in flight.
+	PoolSize = 8
 )
 
 // Errors.
@@ -181,11 +199,12 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := policypool.OpenConnector(ctx, n, policypool.ForeignKeysRequired)
+	db, err := policypool.OpenConnector(ctx, n, policypool.ForeignKeysRequiredAtConnect)
 	if err != nil {
 		n.Close()
 		return nil, fmt.Errorf("tursoraft/replica: pool for %s: %w", cfg.Path, err)
 	}
+	db.SetMaxIdleConns(PoolSize)
 	r := &Replica{
 		cfg: cfg, log: log, interval: cfg.syncInterval(), native: n, db: db,
 		reqs: make(chan chan error),

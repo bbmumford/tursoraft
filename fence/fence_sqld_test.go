@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/bbmumford/tursoraft/fence"
-	"github.com/bbmumford/tursoraft/internal/sqldtest"
 	"github.com/bbmumford/tursoraft/replica"
+	"github.com/bbmumford/tursoraft/sqldtest"
 )
 
 func replicas(t *testing.T) (a, b *replica.Replica) {
