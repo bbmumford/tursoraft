@@ -45,6 +45,7 @@ type DatabaseHandle struct {
 	syncFunc   func(context.Context) error
 	statsFunc  func(context.Context) (SyncStats, error)
 	closeFuncs []func() error
+	poolCloser func() error
 }
 
 // NewDatabaseHandle creates a new database handle wrapper
@@ -115,8 +116,20 @@ func (h *DatabaseHandle) Sync(ctx context.Context) error {
 	return h.syncFunc(ctx)
 }
 
+// WithPoolCloser makes fn the only way Close closes the pool: Close runs the
+// cleanup functions, then fn, and never closes the pool itself.
+//
+// connectors.MakeConnector sets it to the replica's Close, which waits for a
+// pull still inside the replica engine before it closes the pool. When that
+// wait runs out, the replica's Close returns an error and closes the pool
+// once the pull returns; a handle that closed the pool itself at that point
+// would close the connector under the pull.
+func (h *DatabaseHandle) WithPoolCloser(fn func() error) {
+	h.poolCloser = fn
+}
+
 // Close runs the cleanup functions, in the order they were added, and then
-// closes the pool.
+// closes the pool, through the pool closer when one is set.
 //
 // The cleanup functions run first because a replica's sync loop drives the
 // connector the pool owns, and must stop before the pool closes it.
@@ -127,7 +140,12 @@ func (h *DatabaseHandle) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if h.db != nil {
+	switch {
+	case h.poolCloser != nil:
+		if err := h.poolCloser(); err != nil {
+			errs = append(errs, err)
+		}
+	case h.db != nil:
 		if err := h.db.Close(); err != nil {
 			errs = append(errs, err)
 		}

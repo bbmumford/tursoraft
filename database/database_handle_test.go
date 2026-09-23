@@ -98,6 +98,23 @@ func TestCloseRunsCleanupBeforeThePool(t *testing.T) {
 	}
 }
 
+// A handle with a pool closer never closes the pool itself, even when the
+// closer returns an error: a replica whose pull outlasted its close wait
+// returns one and closes the pool only when the pull returns.
+func TestAPoolCloserOwnsThePool(t *testing.T) {
+	var order []string
+	h := NewDatabaseHandle(sql.OpenDB(recordingConnector{&order}))
+	h.AddCloser(func() error { order = append(order, "cleanup"); return nil })
+	pulling := errors.New("a pull is still inside the engine")
+	h.WithPoolCloser(func() error { order = append(order, "owner"); return pulling })
+	if err := h.Close(); !errors.Is(err, pulling) {
+		t.Fatalf("Close: got %v, want the pool closer's error", err)
+	}
+	if len(order) != 2 || order[0] != "cleanup" || order[1] != "owner" {
+		t.Errorf("close order %v, want [cleanup owner] and no pool close", order)
+	}
+}
+
 // recordingConnector notes when the pool closes it.
 type recordingConnector struct{ order *[]string }
 

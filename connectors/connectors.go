@@ -57,7 +57,7 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 		h := database.NewDatabaseHandle(r.DB())
 		h.WithSync(r.Sync)
 		h.WithSyncStats(func(context.Context) (database.SyncStats, error) { return r.SyncStats(), nil })
-		h.AddCloser(r.Close)
+		h.WithPoolCloser(r.Close)
 		return h, nil
 	}
 
