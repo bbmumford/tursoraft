@@ -60,10 +60,10 @@ mgr, err := manager.NewManager(ctx, manager.ManagerConfig{
             Name: "orbtr-control", URL: "libsql://orbtr-control-orbtr.turso.io", AuthToken: dbToken,
         }},
         Raft: &manager.RaftSpec{
-            VoterServices:   []string{"node.orbtr.ai", "node.orbtr.io"},
+            VoterServices:   []string{"node-orbtr-ai", "node-orbtr-io"},
             VoterCount:      5,
             BootstrapExpect: 3,
-            Jobs:            map[string][]string{"projector": {"api.orbtr.ai", "node.orbtr.io"}},
+            Jobs:            map[string][]string{"projector": {"api-orbtr-ai", "node-orbtr-io"}},
         },
     }},
     RaftConfig: manager.RaftConfig{LocalDir: "/data/tursoraft"},
@@ -79,6 +79,12 @@ name outside `^[a-z0-9][a-z0-9_-]*$`; a raft block over other than one shared
 database, with no voters, or with `bootstrapExpect` outside `1..voterCount`; a
 raft block with no mesh; a voter whose state is not under `VolumeDir`; and, in
 a build without cgo, any shared group (`ErrReplicaNeedsCGO`).
+
+Voter and job-host names are the service names `mesh.Mesh.LocalService`
+reports (loom's node `ServiceName`), not domains. A process whose service is
+neither a voter nor a host of any job gets no seat: `Validate` accepts it and
+`Job` answers `ErrNoCluster`, and a block whose voters name no running service
+never forms a cluster.
 
 ## Files
 
