@@ -27,6 +27,7 @@ type Hub struct {
 	mu       sync.Mutex
 	nodes    map[string]*Node
 	isolated map[string]int // node → island; nodes on different islands cannot see or reach each other
+	islands  int            // islands made so far; each Isolate takes the next number
 }
 
 // NewHub returns an empty hub.
@@ -62,7 +63,8 @@ func (h *Hub) Node(id, service string) *Node {
 func (h *Hub) Isolate(ids ...string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	island := len(h.isolated) + 1
+	h.islands++
+	island := h.islands
 	for _, id := range ids {
 		h.isolated[id] = island
 	}
