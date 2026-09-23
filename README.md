@@ -80,10 +80,6 @@ database, with no voters, or with `bootstrapExpect` outside `1..voterCount`; a
 raft block with no mesh; a voter whose state is not under `VolumeDir`; and, in
 a build without cgo, any shared group (`ErrReplicaNeedsCGO`).
 
-`TursoConfig`, `PeerEnvVar`, `SnapMinGap`, `UseEmbedded`,
-`RaftConfig.RaftBindAddr` and `RaftConfig.SnapshotDir` are accepted and
-ignored; loom's node runtime sets them.
-
 ## Files
 
 Everything lives under `LocalDir`, each kind under its own prefix so no two

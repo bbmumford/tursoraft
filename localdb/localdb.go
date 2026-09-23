@@ -1,9 +1,11 @@
 // Package localdb opens a database file that one process owns, through the
 // tursogo engine, encrypted at rest and pooled by policypool.
 //
-// Consumed by the Manager for a pureLocal group's databases and by
-// connectors.MakeConnector. A local file is authoritative: nothing else holds
-// its rows, so nothing here ever deletes one.
+// Consumed by the Manager for a pureLocal group's databases, by
+// connectors.MakeConnector, by loom's node runtime for its LAD file, and by
+// the replica package, which calls IsPlaintext before it opens a replica. A
+// local file is authoritative: nothing else holds its rows, so nothing here
+// ever deletes one.
 package localdb
 
 import (
@@ -66,21 +68,6 @@ func Open(ctx context.Context, path string, key []byte) (*sql.DB, error) {
 		return nil, fmt.Errorf("%w: %s", ErrPlaintext, path)
 	}
 	return open(ctx, path, DSN(path, key))
-}
-
-// OpenPlaintext opens the file at path unencrypted.
-//
-// Consumed only by tests that need a plaintext file to prove it is refused or
-// replaced: this package's, the replica package's, and loom's test that a LAD
-// file its node cannot read is replaced. No production path opens a database
-// without a key.
-// TODO: delete once those fixtures create the file through the "turso" driver
-// directly.
-func OpenPlaintext(ctx context.Context, path string) (*sql.DB, error) {
-	if err := prepare(path); err != nil {
-		return nil, err
-	}
-	return open(ctx, path, DSN(path, nil))
 }
 
 func prepare(path string) error {
