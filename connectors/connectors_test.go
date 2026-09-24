@@ -2,17 +2,15 @@ package connectors
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/base64"
 	"errors"
-	"go/parser"
-	"go/token"
-	"io/fs"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bbmumford/tursoraft/localdb"
@@ -66,39 +64,52 @@ func TestKeyedLocalFileIsEncrypted(t *testing.T) {
 	}
 }
 
-// Importing this package registers driver "libsql" for the partition pools
-// that open it by name.
-func TestTheHranaDriverIsRegistered(t *testing.T) {
-	if !slices.Contains(sql.Drivers(), "libsql") {
-		t.Fatalf("drivers %v: libsql is not registered", sql.Drivers())
-	}
-}
+// hranaClient is the module of libsql-client-go, which registers database/sql
+// driver "libsql". The partition-database pools that open "libsql" (cortex
+// tenant/tenantdb, constellation domain/identity/provisioning/tenantdb) import
+// it themselves, and this module opens its databases through go-libsql and
+// tursogo, so no package or test here needs it.
+const hranaClient = "github.com/tursodatabase/libsql-client-go"
 
-// Only libsql_driver.go imports the Hrana client, so deleting that one file
-// removes the dependency.
-func TestOnlyThisFileImportsTheHranaClient(t *testing.T) {
-	root, err := filepath.Abs("..")
+// moduleDeps is every package that a package or test of this module depends
+// on, as the go command resolves them from the module root.
+var moduleDeps = sync.OnceValues(func() ([]string, error) {
+	cmd := exec.Command("go", "list", "-deps", "-test", "./...")
+	cmd.Dir = ".."
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("go list: %w\n%s", err, out)
+	}
+	return strings.Fields(string(out)), nil
+})
+
+// No package or test of this module depends on libsql-client-go, so linking
+// any tursoraft package registers no "libsql" driver.
+func TestNothingDependsOnTheHranaClient(t *testing.T) {
+	deps, err := moduleDeps()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var importers []string
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
-			return err
+	var hrana []string
+	for _, dep := range deps {
+		if dep == hranaClient || strings.HasPrefix(dep, hranaClient+"/") {
+			hrana = append(hrana, dep)
 		}
-		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
-		if err != nil {
-			return err
-		}
-		for _, imp := range f.Imports {
-			if p, _ := strconv.Unquote(imp.Path.Value); strings.HasPrefix(p, "github.com/tursodatabase/libsql-client-go") {
-				rel, _ := filepath.Rel(root, path)
-				importers = append(importers, rel)
-			}
-		}
-		return nil
-	})
-	if len(importers) != 1 || importers[0] != filepath.Join("connectors", "libsql_driver.go") {
-		t.Errorf("files importing libsql-client-go: %v", importers)
+	}
+	if len(hrana) != 0 {
+		t.Errorf("packages of %s in this module's dependencies: %v", hranaClient, hrana)
+	}
+}
+
+// The listing TestNothingDependsOnTheHranaClient reads covers the packages
+// that open databases: it holds policypool, which replica and localdb import,
+// so an empty or partial listing cannot pass for a clean one.
+func TestTheDependencyListingReachesTheOpeners(t *testing.T) {
+	deps, err := moduleDeps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(deps, "github.com/bbmumford/policypool") {
+		t.Errorf("the listing of %d packages does not hold policypool", len(deps))
 	}
 }

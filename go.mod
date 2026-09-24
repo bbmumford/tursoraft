@@ -8,7 +8,6 @@ require (
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/tursodatabase/libsql-client-go v0.0.0-20240902231107-85af5b9d094d
 	go.etcd.io/bbolt v1.3.5
 	go.uber.org/goleak v1.3.0
 	turso.tech/database/tursogo v0.8.0-pre.12
@@ -18,7 +17,6 @@ require (
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
-	github.com/coder/websocket v1.8.12 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/hashicorp/go-immutable-radix v1.0.0 // indirect
