@@ -66,9 +66,9 @@ func TestKeyedLocalFileIsEncrypted(t *testing.T) {
 
 // hranaClient is the module of libsql-client-go, which registers database/sql
 // driver "libsql". The partition-database pools that open "libsql" (cortex
-// tenant/tenantdb, constellation domain/identity/provisioning/tenantdb) import
-// it themselves, and this module opens its databases through go-libsql and
-// tursogo, so no package or test here needs it.
+// tenant/tenantdb, constellation domain/identity/provisioning/tenantdb, xyz
+// library/tenantdb) import it themselves, and this module opens its databases
+// through go-libsql and tursogo, so no package or test here needs it.
 const hranaClient = "github.com/tursodatabase/libsql-client-go"
 
 // moduleDeps is every package that a package or test of this module depends
@@ -103,7 +103,8 @@ func TestNothingDependsOnTheHranaClient(t *testing.T) {
 
 // The listing TestNothingDependsOnTheHranaClient reads covers the packages
 // that open databases: it holds policypool, which replica and localdb import,
-// so an empty or partial listing cannot pass for a clean one.
+// so an empty listing, or one that misses those openers, cannot pass for a
+// clean one.
 func TestTheDependencyListingReachesTheOpeners(t *testing.T) {
 	deps, err := moduleDeps()
 	if err != nil {
