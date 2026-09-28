@@ -9,11 +9,13 @@
 // for readiness and stop the process the same way instead of keeping its own
 // sqld launcher.
 //
-// The binary is $TURSORAFT_SQLD, else /opt/homebrew/bin/sqld, else sqld on
-// PATH; with none the test is skipped.
+// The binary is $TURSORAFT_SQLD, else the newest of /opt/homebrew/bin/sqld,
+// sqld on PATH and each ~/.local/share/libsql-server/<version>/sqld (see
+// Binary); with none the test is skipped.
 package sqldtest
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -41,18 +43,97 @@ type Server struct {
 	exited chan struct{}
 }
 
+// homebrewSqld is where Homebrew links sqld on Apple silicon. It is a
+// candidate even when a test's PATH leaves /opt/homebrew/bin out, and a
+// variable so the selection tests can point it at a stand-in.
+var homebrewSqld = "/opt/homebrew/bin/sqld"
+
+// releaseGlob, under the user's home directory, matches the sqld of each
+// unpacked libsql-server release, one directory per version. A release
+// installed there sits beside the package manager's sqld without shadowing
+// the sqld on PATH.
+const releaseGlob = ".local/share/libsql-server/*/sqld"
+
 // Binary returns the sqld the tests use, or "" when there is none.
+//
+// $TURSORAFT_SQLD, when set, is used as given. Otherwise the candidates are
+// /opt/homebrew/bin/sqld, sqld on PATH and each
+// ~/.local/share/libsql-server/<version>/sqld, and Binary takes the one whose
+// --version names the newest release. A candidate whose version cannot be read
+// ranks below every one whose version can, and a tie keeps the earlier
+// candidate. The newest wins because RequireConcurrentTransactions skips every
+// test that holds two replicas' write transactions at once on a sqld before
+// 0.24, so taking the first candidate found would skip those tests whenever an
+// older sqld is found first.
 func Binary() string {
 	if p := os.Getenv("TURSORAFT_SQLD"); p != "" {
 		return p
 	}
-	if _, err := os.Stat("/opt/homebrew/bin/sqld"); err == nil {
-		return "/opt/homebrew/bin/sqld"
+	best, bestVersion, bestKnown := "", [3]int{}, false
+	for _, p := range candidates() {
+		v, known := binaryVersion(p)
+		if best == "" || known && (!bestKnown || newer(v, bestVersion)) {
+			best, bestVersion, bestKnown = p, v, known
+		}
 	}
+	return best
+}
+
+// candidates lists the existing sqld files Binary chooses among, each once,
+// in its tie-break order.
+func candidates() []string {
+	var out []string
+	add := func(p string) {
+		for _, q := range out {
+			if q == p {
+				return
+			}
+		}
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			out = append(out, p)
+		}
+	}
+	add(homebrewSqld)
 	if p, err := exec.LookPath("sqld"); err == nil {
-		return p
+		add(p)
 	}
-	return ""
+	if home, err := os.UserHomeDir(); err == nil {
+		matches, _ := filepath.Glob(filepath.Join(home, releaseGlob))
+		for _, p := range matches {
+			add(p)
+		}
+	}
+	return out
+}
+
+// binaryVersion runs "<bin> --version", which sqld answers with a line such
+// as "sqld sqld 0.24.32 (40c272de 2025-02-14)", and returns its first
+// major.minor.patch field. known is false when the binary fails, does not
+// answer within ten seconds, or prints no such field.
+func binaryVersion(bin string) (v [3]int, known bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").Output()
+	if err != nil {
+		return v, false
+	}
+	for _, f := range strings.Fields(string(out)) {
+		var a, b, c int
+		if _, err := fmt.Sscanf(f, "%d.%d.%d", &a, &b, &c); err == nil {
+			return [3]int{a, b, c}, true
+		}
+	}
+	return v, false
+}
+
+// newer reports whether version a is later than version b.
+func newer(a, b [3]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] > b[i]
+		}
+	}
+	return false
 }
 
 // Start starts sqld and stops it when the test ends.
@@ -162,6 +243,6 @@ func (s *Server) AtLeast(major, minor int) bool {
 func (s *Server) RequireConcurrentTransactions(t testing.TB) {
 	t.Helper()
 	if !s.AtLeast(0, 24) {
-		t.Skipf("sqld %s cannot run two replicas' write transactions concurrently; set TURSORAFT_SQLD to sqld 0.24 or later", s.Version)
+		t.Skipf("sqld %s cannot run two replicas' write transactions concurrently; set TURSORAFT_SQLD to sqld 0.24 or later, or unpack one as ~/.local/share/libsql-server/<version>/sqld", s.Version)
 	}
 }
