@@ -4,6 +4,7 @@ package sqldtest
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -26,9 +27,9 @@ type machine struct {
 }
 
 // install writes the machine's binaries as shell scripts under a temporary
-// directory, points homebrewSqld, PATH, HOME and TURSORAFT_SQLD at them, and
-// returns each binary's path by "homebrew", "path", "override" or its release
-// directory name.
+// directory, runs each once, points homebrewSqld, PATH, HOME and
+// TURSORAFT_SQLD at them, and returns each binary's path by "homebrew",
+// "path", "override" or its release directory name.
 func (m machine) install(t *testing.T) map[string]string {
 	t.Helper()
 	root := t.TempDir()
@@ -43,6 +44,14 @@ func (m machine) install(t *testing.T) map[string]string {
 		script := "#!/bin/sh\necho '" + version + "'\n"
 		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 			t.Fatal(err)
+		}
+		// A newly written executable's first run is much slower than its
+		// later runs, and under load it can pass binaryVersion's ten-second
+		// bound, so Binary would rank the stand-in as unreadable and the
+		// case would fail on timing, not selection. Running each stand-in
+		// once here, with no bound, takes that first run outside Binary.
+		if err := exec.Command(path, "--version").Run(); err != nil {
+			t.Fatalf("first run of the %s stand-in: %v", name, err)
 		}
 		paths[name] = path
 	}
