@@ -173,10 +173,22 @@ use tursoraft carry the same lines in their `go.work`.
 
 Tests that need a primary start a local sqld through `sqldtest`, on
 127.0.0.1 and a free port, and stop only the process they started. The binary
-is `$TURSORAFT_SQLD`, else `/opt/homebrew/bin/sqld`, else `sqld` on `PATH`;
-with none they skip. Tests that hold `BEGIN IMMEDIATE` on two replicas at once
-need sqld 0.24 or later and skip on older ones, which never answer the second
-replica.
+is `$TURSORAFT_SQLD` when set; otherwise the newest, by `sqld --version`, of
+`/opt/homebrew/bin/sqld`, `sqld` on `PATH` and each
+`~/.local/share/libsql-server/<version>/sqld`; with none they skip. Tests that
+hold `BEGIN IMMEDIATE` on two replicas at once need sqld 0.24 or later and skip
+on older ones, which never answer the second replica.
+
+A libsql-server release unpacked into its own version directory is found
+without shadowing the `sqld` on `PATH`:
+
+```
+mkdir -p ~/.local/share/libsql-server/0.24.32
+cp sqld ~/.local/share/libsql-server/0.24.32/
+go test -race -count=1 -p 2 ./...
+```
+
+To run against one binary, name it:
 
 ```
 TURSORAFT_SQLD=/path/to/sqld-0.24 go test -race -count=1 -p 2 ./...
