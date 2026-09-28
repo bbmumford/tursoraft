@@ -180,7 +180,24 @@ func runChild() {
 	for (c.fsm.clusterID() == "" || c.Leader() == "") && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	os.WriteFile(filepath.Join(root, fmt.Sprintf("%s.%s.out", id, round)), []byte(c.fsm.clusterID()+" "+state), 0o600)
+	report := filepath.Join(root, fmt.Sprintf("%s.%s.out", id, round))
+	if err := writeReport(report, []byte(c.fsm.clusterID()+" "+state)); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	time.Sleep(time.Until(deadline))
 	os.Exit(0)
+}
+
+// writeReport gives the parent's read a member's report only whole: the
+// bytes go to a sibling file, which is then renamed onto the name read polls
+// for. read takes any file it can open as the report, so a report written in
+// place can be read between its creation and its bytes, as an empty cluster
+// ID.
+func writeReport(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
