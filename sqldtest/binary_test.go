@@ -101,6 +101,35 @@ func TestTheDefaultIsTheNewestSqld(t *testing.T) {
 	}
 }
 
+// TestEqualVersionsKeepTheEarlierCandidate: when two candidates answer
+// --version with the same release, and when neither answers with one at all,
+// Binary keeps whichever candidates lists first. candidates lists Homebrew's
+// sqld, then the sqld on PATH, then each release directory filepath.Glob
+// returns, so keeping the first of an equal set is what fixes the sqld a run
+// uses to that order instead of to whichever equal candidate the loop reaches
+// last. Binary replaces its choice only on a strictly newer readable version,
+// and only a readable one can displace a readable one, which are the two
+// conditions this pins.
+func TestEqualVersionsKeepTheEarlierCandidate(t *testing.T) {
+	cases := []struct {
+		name string
+		m    machine
+	}{
+		{"two candidates name the same release",
+			machine{homebrew: sqld02432, releases: map[string]string{"0.24.32": sqld02432}}},
+		{"neither candidate prints a version",
+			machine{homebrew: noVersion, releases: map[string]string{"0.24.32": noVersion}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			paths := c.m.install(t)
+			if got, want := Binary(), paths["homebrew"]; got != want {
+				t.Fatalf("Binary() = %q, want %q (homebrew)", got, want)
+			}
+		})
+	}
+}
+
 // TestAnOlderOrUnreadableSqldIsNotTheDefault: Binary never prefers a sqld
 // whose version cannot be read over one whose version can, never replaces
 // $TURSORAFT_SQLD with a newer sqld, and finds nothing on a machine with no
