@@ -129,6 +129,13 @@ func TestRestartAcrossProcessesKeepsTheCluster(t *testing.T) {
 	var clusterID string
 	for id, r := range first {
 		cid, _, _ := strings.Cut(r, " ")
+		// A member that reports no cluster ID is not in the cluster round 2
+		// then compares itself against: clusterID takes the first report that
+		// carries one, so without this an empty ID agrees with every other
+		// report and the round passes on a member that never applied one.
+		if cid == "" {
+			t.Fatalf("round 1: %s reports no cluster ID: %q", id, r)
+		}
 		if clusterID == "" {
 			clusterID = cid
 		}
