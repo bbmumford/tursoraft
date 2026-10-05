@@ -18,9 +18,11 @@ import (
 )
 
 // outageWriter is a job body that writes its epoch and node through the
-// fence every 50 ms and records each attempt's outcome. It returns the first
-// failed write, which leaves the retry to the cluster's backoff; once stop is
-// set it writes nothing more and closes idle.
+// fence every 50 ms and records each attempt's outcome, counting the commits
+// under the epoch they committed under so that the rows the primary ends up
+// holding can be compared key by key. It returns the first failed write,
+// which leaves the retry to the cluster's backoff; once stop is set it writes
+// nothing more and closes idle.
 type outageWriter struct {
 	db   *sql.DB
 	node string
@@ -29,7 +31,7 @@ type outageWriter struct {
 	park sync.Once
 
 	mu     sync.Mutex
-	acked  int
+	acked  map[uint64]int
 	failed []error
 }
 
@@ -41,7 +43,7 @@ func (w *outageWriter) run(ctx context.Context, f fence.Fence) error {
 		})
 		w.mu.Lock()
 		if err == nil {
-			w.acked++
+			w.acked[f.Epoch]++
 		} else {
 			w.failed = append(w.failed, err)
 		}
@@ -60,11 +62,30 @@ func (w *outageWriter) run(ctx context.Context, f fence.Fence) error {
 	return nil
 }
 
-// counts returns the writes that committed and the attempts that failed.
+// counts returns the writes that committed, under every epoch together, and
+// the attempts that failed.
 func (w *outageWriter) counts() (int, []error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.acked, append([]error(nil), w.failed...)
+	n := 0
+	for _, c := range w.acked {
+		n += c
+	}
+	return n, append([]error(nil), w.failed...)
+}
+
+// byEpoch returns the writes that committed under each epoch, which is what
+// the rows on the primary are checked against: the cluster runs the body
+// again under a new fence each time the job's assignment is written again, so
+// one holder's rows carry every epoch it ran under, not only the last.
+func (w *outageWriter) byEpoch() map[uint64]int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make(map[uint64]int, len(w.acked))
+	for epoch, c := range w.acked {
+		out[epoch] = c
+	}
+	return out
 }
 
 // While the primary is down a fenced job pauses where it is: its holder
@@ -99,7 +120,7 @@ func TestFencedJobPausesThroughAnOutage(t *testing.T) {
 	for _, p := range procs {
 		p.m.Sync(ctx)
 		db, _ := p.m.Database("control", "orbtr-control")
-		p.w = &outageWriter{db: db, node: p.id, idle: make(chan struct{})}
+		p.w = &outageWriter{db: db, node: p.id, idle: make(chan struct{}), acked: map[uint64]int{}}
 		j, err := p.m.Job("control", "orbtr-control", "projector", p.w.run)
 		if err != nil {
 			t.Fatal(err)
@@ -132,7 +153,6 @@ func TestFencedJobPausesThroughAnOutage(t *testing.T) {
 	acked := func() int { n, _ := h.w.counts(); return n }
 	failures := func() int { _, f := h.w.counts(); return len(f) }
 	wait(10*time.Second, "a committed write", func() bool { return acked() > 0 })
-
 	s.Stop()
 	wait(20*time.Second, "a write to fail", func() bool { return failures() > 0 })
 	before := acked()
@@ -168,7 +188,7 @@ func TestFencedJobPausesThroughAnOutage(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the job body did not stop writing")
 	}
-	n, failed := h.w.counts()
+	_, failed := h.w.counts()
 	for _, err := range failed {
 		if errors.Is(err, fence.ErrFenced) || errors.Is(err, fence.ErrForeignCluster) {
 			t.Errorf("the fence refused the job's own holder: %v", err)
@@ -184,6 +204,7 @@ func TestFencedJobPausesThroughAnOutage(t *testing.T) {
 	}
 	defer rows.Close()
 	got := map[string]int{}
+	var top int64
 	for rows.Next() {
 		var epoch int64
 		var node string
@@ -192,12 +213,44 @@ func TestFencedJobPausesThroughAnOutage(t *testing.T) {
 			t.Fatal(err)
 		}
 		got[fmt.Sprintf("%s@%d", node, epoch)] = c
+		if epoch > top {
+			top = epoch
+		}
+	}
+	want := map[string]int{}
+	for epoch, c := range h.w.byEpoch() {
+		want[fmt.Sprintf("%s@%d", h.id, epoch)] = c
 	}
 	// The write in flight when the primary stopped may have committed there
 	// with its answer lost, so the primary may hold one write more than the
-	// holder saw commit, never fewer.
-	want := fmt.Sprintf("%s@%d", h.id, held.Epoch)
-	if len(got) != 1 || got[want] < n || got[want] > n+1 {
-		t.Errorf("writes on the primary by holder and epoch: %v; the holder saw %d commit as %s", got, n, want)
+	// holder saw commit under the epoch it held across the outage, the one
+	// the checks above hold to held; exactly as many under every other epoch
+	// it ran under; and nothing under a key it did not write.
+	inflight := fmt.Sprintf("%s@%d", h.id, held.Epoch)
+	// The fence the job reports holding is the one its body was handed: the
+	// writer stamps every row with the epoch it ran under, so the epoch read
+	// back from the job has rows of its own, the writes made after the
+	// primary returned.
+	if _, ran := want[inflight]; !ran {
+		t.Errorf("the holder reports holding %s and committed nothing under it; it committed %v", inflight, want)
+	}
+	// Every epoch a row carries was handed to the body as its fence, and a
+	// fence carries the epoch of the assignment the body runs under, which
+	// only rises, so the epoch the job reports bounds every row: a run that
+	// raised the epoch itself, rather than taking the assignment's, would
+	// leave a row above it. The count comparison alone cannot see that,
+	// because the writer records the same epoch it stamps.
+	if top > int64(held.Epoch) {
+		t.Errorf("the primary holds a write under epoch %d, above the %d the holder reports: %v", top, held.Epoch, got)
+	}
+	agrees := len(got) == len(want)
+	for key, c := range want {
+		if g := got[key]; g != c && !(key == inflight && g == c+1) {
+			agrees = false
+		}
+	}
+	if !agrees {
+		t.Errorf("writes on the primary by holder and epoch: %v; the holder saw %v commit, and only %s may hold one more",
+			got, want, inflight)
 	}
 }
