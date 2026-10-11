@@ -165,3 +165,63 @@ func TestStatsReportStaleness(t *testing.T) {
 		t.Errorf("sync stats %+v", ss)
 	}
 }
+
+// Callers that arrive while a pull is running share the next pull, however
+// long that pull took. Each is blocked sending its request while the loop is
+// inside the engine; once the pull returns, the gap since it started has
+// already passed, so a loop that took one request at a time would pull once
+// per caller, one after another. A session store asks for a pull on every
+// proved request, so against a slow primary that queue grows with the request
+// rate.
+func TestCallersQueuedBehindASlowPullShareTheNextOne(t *testing.T) {
+	f := &fakeNative{pullTime: 300 * time.Millisecond}
+	r := newLoopReplica(f, time.Hour)
+	defer r.Close()
+	time.Sleep(400 * time.Millisecond) // the loop's first pull
+	base := f.pulls.Load()
+
+	first := make(chan error, 1)
+	go func() { first <- r.Sync(context.Background()) }()
+	for !f.inPull.Load() {
+		time.Sleep(time.Millisecond)
+	}
+
+	const callers = 16
+	var wg sync.WaitGroup
+	var late atomic.Int64
+	start := time.Now()
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			called := time.Now()
+			if err := r.Sync(context.Background()); err != nil {
+				t.Errorf("Sync: %v", err)
+				return
+			}
+			f.mu.Lock()
+			last := f.starts[len(f.starts)-1]
+			f.mu.Unlock()
+			if last.Before(called) {
+				late.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	if err := <-first; err != nil {
+		t.Fatalf("the first Sync: %v", err)
+	}
+
+	pulls := f.pulls.Load() - base
+	if late.Load() != 0 {
+		t.Errorf("%d callers returned without a pull that started after their call", late.Load())
+	}
+	// One pull for the first caller and one shared by the sixteen queued behind it.
+	if pulls > 2 {
+		t.Errorf("one caller and %d queued behind its pull made %d pulls, want 2: the queued callers did not share one", callers, pulls)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("the queued callers took %v, want them answered by the one pull after the first", elapsed)
+	}
+}
