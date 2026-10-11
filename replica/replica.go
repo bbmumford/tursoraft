@@ -61,6 +61,10 @@ const (
 	// and cookies arrive faster than a pull completes; the gap bounds the
 	// pulls to four a second however many requests arrive.
 	SyncGap = 250 * time.Millisecond
+	// maxPullBatch bounds how many waiting callers one pull answers. Callers
+	// beyond it share the next pull, SyncGap later; without a bound a stream
+	// of callers faster than the loop takes them holds the pull off.
+	maxPullBatch = 1024
 	// closeWait is how long Close waits for a pull in progress. The native
 	// pull takes no context, so one against a primary that stopped answering
 	// may outlast it.
@@ -419,14 +423,23 @@ func (r *Replica) loop() {
 		}
 		// Callers that arrived while the last pull ran are each blocked on
 		// their send, and the gap since that pull started has passed, so taking
-		// one at a time would give each its own pull, one after another. Every
-		// one ready now shares this pull instead.
-		for drained := false; !drained; {
+		// one at a time would give each its own pull, one after another. Those
+		// ready now share this pull instead, at most maxPullBatch of them, so
+		// callers arriving faster than they are taken cannot hold the pull off;
+		// the rest share the next one. Close is read while they are taken, so
+		// it is not held behind them.
+	take:
+		for len(waiting) < maxPullBatch {
 			select {
+			case <-r.stop:
+				for _, w := range waiting {
+					w <- ErrClosed
+				}
+				return
 			case w := <-r.reqs:
 				waiting = append(waiting, w)
 			default:
-				drained = true
+				break take
 			}
 		}
 		batch := waiting

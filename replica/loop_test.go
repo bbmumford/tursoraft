@@ -225,3 +225,65 @@ func TestCallersQueuedBehindASlowPullShareTheNextOne(t *testing.T) {
 		t.Errorf("the queued callers took %v, want them answered by the one pull after the first", elapsed)
 	}
 }
+
+// One pull answers at most maxPullBatch of the callers waiting for it, and
+// the rest share the pulls after it. Taking every caller that is ready, with
+// no bound, lets callers arriving faster than they are taken hold the next
+// pull off; the bound is what keeps the pull coming. Every caller is answered
+// once, by a pull that started after its call.
+func TestOnePullAnswersAtMostABatchOfWaitingCallers(t *testing.T) {
+	f := &fakeNative{pullTime: 300 * time.Millisecond}
+	r := newLoopReplica(f, time.Hour)
+	time.Sleep(400 * time.Millisecond) // the loop's first pull
+	base := f.pulls.Load()
+
+	first := make(chan error, 1)
+	go func() { first <- r.Sync(context.Background()) }()
+	for !f.inPull.Load() {
+		time.Sleep(time.Millisecond)
+	}
+
+	const callers = 2*maxPullBatch + 100
+	var wg sync.WaitGroup
+	var late, failed atomic.Int64
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			called := time.Now()
+			if err := r.Sync(context.Background()); err != nil {
+				failed.Add(1)
+				return
+			}
+			f.mu.Lock()
+			last := f.starts[len(f.starts)-1]
+			f.mu.Unlock()
+			if last.Before(called) {
+				late.Add(1)
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("callers still waiting 10s after they called")
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("the first Sync: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if failed.Load() != 0 || late.Load() != 0 {
+		t.Errorf("%d callers failed and %d returned without a pull that started after their call", failed.Load(), late.Load())
+	}
+	// The first caller's pull, then three batches for the callers queued
+	// behind it.
+	want := int64(1 + (callers+maxPullBatch-1)/maxPullBatch)
+	if pulls := f.pulls.Load() - base; pulls < want {
+		t.Errorf("%d callers queued behind one pull were answered by %d pulls, want %d: one pull took more than maxPullBatch", callers, pulls, want)
+	}
+}
