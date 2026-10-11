@@ -360,8 +360,9 @@ func (r *Replica) SyncStats() database.SyncStats { return r.Stats().SyncStats() 
 // call has finished, or ctx ends.
 //
 // Every pull runs on the sync loop, one at a time: callers waiting together
-// share one pull, and a pull starts no sooner than SyncGap after the last one
-// started. A caller whose ctx ends stops waiting; the pull still completes.
+// share one pull, including every caller that arrived while the previous pull
+// ran, and a pull starts no sooner than SyncGap after the last one started. A
+// caller whose ctx ends stops waiting; the pull still completes.
 func (r *Replica) Sync(ctx context.Context) error {
 	w := make(chan error, 1)
 	select {
@@ -415,6 +416,18 @@ func (r *Replica) loop() {
 		}
 		if !due {
 			continue
+		}
+		// Callers that arrived while the last pull ran are each blocked on
+		// their send, and the gap since that pull started has passed, so taking
+		// one at a time would give each its own pull, one after another. Every
+		// one ready now shares this pull instead.
+		for drained := false; !drained; {
+			select {
+			case w := <-r.reqs:
+				waiting = append(waiting, w)
+			default:
+				drained = true
+			}
 		}
 		batch := waiting
 		waiting = nil
