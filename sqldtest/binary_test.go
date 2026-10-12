@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 const (
@@ -127,6 +128,59 @@ func TestEqualVersionsKeepTheEarlierCandidate(t *testing.T) {
 				t.Fatalf("Binary() = %q, want %q (homebrew)", got, want)
 			}
 		})
+	}
+}
+
+// TestASlowFirstRunDoesNotRankAReleaseUnreadable: a release this host has not
+// run before can answer its first --version past versionBound and every later
+// one well inside it, which is the state of a release that was just unpacked.
+// Binary still reads it, so the newest release is still what Start runs and
+// RequireConcurrentTransactions does not skip on the older sqld beside it.
+//
+// The stand-in is not run before Binary reads it, unlike machine.install's,
+// because the first run is the condition under test: it sleeps past the bound
+// once, with its output off binaryVersion's pipe so the cut-off run returns at
+// the bound, and answers at once from then on.
+func TestASlowFirstRunDoesNotRankAReleaseUnreadable(t *testing.T) {
+	previousBound := versionBound
+	versionBound = 2 * time.Second
+	t.Cleanup(func() { versionBound = previousBound })
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	write := func(path, script string) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	homebrew := filepath.Join(root, "homebrew", "bin", "sqld")
+	write(homebrew, "echo '"+sqld023+"'\n")
+	if err := exec.Command(homebrew, "--version").Run(); err != nil {
+		t.Fatalf("first run of the homebrew stand-in: %v", err)
+	}
+	release := filepath.Join(home, ".local", "share", "libsql-server", "0.24.32", "sqld")
+	slept := filepath.Join(root, "release.slept")
+	write(release, "if [ ! -f '"+slept+"' ]; then : > '"+slept+"'; exec /bin/sleep 60 >/dev/null 2>&1; fi\necho '"+sqld02432+"'\n")
+
+	previousHomebrew := homebrewSqld
+	homebrewSqld = homebrew
+	t.Cleanup(func() { homebrewSqld = previousHomebrew })
+	empty := filepath.Join(root, "emptypath")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", empty)
+	t.Setenv("HOME", home)
+	t.Setenv("TURSORAFT_SQLD", "")
+
+	if got := Binary(); got != release {
+		t.Fatalf("Binary() = %q, want %q (the release whose first --version ran past the bound)", got, release)
+	}
+	if _, err := os.Stat(slept); err != nil {
+		t.Fatalf("the release stand-in never took its slow first run: %v", err)
 	}
 }
 
