@@ -16,6 +16,7 @@ package sqldtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -106,14 +107,36 @@ func candidates() []string {
 	return out
 }
 
+// versionBound is how long one "<bin> --version" run is given. It is a
+// variable so the slow-first-run case can shorten it instead of holding a
+// stand-in open for the whole bound.
+var versionBound = 10 * time.Second
+
+// versionLine runs "<bin> --version" under versionBound and reports whether
+// the bound, rather than the binary itself, ended the run.
+func versionLine(bin string) (out []byte, timedOut bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), versionBound)
+	defer cancel()
+	out, err = exec.CommandContext(ctx, bin, "--version").Output()
+	return out, errors.Is(ctx.Err(), context.DeadlineExceeded), err
+}
+
 // binaryVersion runs "<bin> --version", which sqld answers with a line such
 // as "sqld sqld 0.24.32 (40c272de 2025-02-14)", and returns its first
 // major.minor.patch field. known is false when the binary fails, does not
-// answer within ten seconds, or prints no such field.
+// answer within two runs of versionBound, or prints no such field.
+//
+// A binary this host has not run before answers its first --version far
+// slower than its later ones, so a run the bound cut off is retried once:
+// that cut-off run leaves the binary warm. Reporting it unreadable instead
+// would leave Binary with an older candidate, and
+// RequireConcurrentTransactions would then skip every test that holds two
+// replicas' write transactions at once.
 func binaryVersion(bin string) (v [3]int, known bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "--version").Output()
+	out, timedOut, err := versionLine(bin)
+	if timedOut {
+		out, _, err = versionLine(bin)
+	}
 	if err != nil {
 		return v, false
 	}
