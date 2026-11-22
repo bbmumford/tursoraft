@@ -22,18 +22,26 @@
 // before it: the pool keeps up to PoolSize of them idle and retires none for
 // age.
 //
+// The engine is handed the key on every open, yet when the primary answers
+// libSQL's HTTP sync protocol the engine opens the file without it and writes
+// it unencrypted. So the file is checked after every open, and a file left
+// unencrypted is closed and refused (ErrPlaintextReplica): it is never
+// served.
+//
 // Consumed by the Manager for every database of a shared group, and by
 // connectors.MakeConnector given a primary URL. The replica file is a cache:
 // deleting it costs one download, which is why a plaintext file found under a
-// configured key is deleted rather than refused.
+// configured key before an open is deleted rather than refused.
 package replica
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -97,6 +105,11 @@ var (
 	// ErrCloseTimedOut means Close returned while a pull was still inside the
 	// native library. The pool closes when that pull returns.
 	ErrCloseTimedOut = errors.New("tursoraft/replica: a pull in progress outlasted close; the pool closes when it returns")
+	// ErrPlaintextReplica means the engine left the replica file unencrypted
+	// although it was given the key, or in a state that cannot be told apart
+	// from that, or that the file could not be read to check. The engine is
+	// closed and nothing is served from the file.
+	ErrPlaintextReplica = errors.New("tursoraft/replica: the engine left the replica file unencrypted under a configured key")
 )
 
 // Config describes one replica.
@@ -203,6 +216,9 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseUnencrypted(cfg.Path, n, log); err != nil {
+		return nil, err
+	}
 	db, err := policypool.OpenConnector(ctx, n, policypool.ForeignKeysRequiredAtConnect)
 	if err != nil {
 		n.Close()
@@ -264,6 +280,65 @@ func removePlaintext(path string, log *slog.Logger) error {
 	}
 	log.Warn("tursoraft: deleted a plaintext replica found under a configured key; it downloads again", "path", path)
 	return nil
+}
+
+// sqliteHeader begins every unencrypted SQLite database file.
+var sqliteHeader = []byte("SQLite format 3\x00")
+
+// infoSuffix names the companion file libSQL's HTTP sync protocol keeps
+// beside a replica; the frame-replication protocol never writes it.
+const infoSuffix = "-info"
+
+// refuseUnencrypted checks the replica file the engine has just opened and
+// pulled into, and closes the engine and refuses when the file is to be taken
+// as unencrypted (unencrypted). The file is left where it is: the next Open's
+// removePlaintext deletes one that begins with the unencrypted header before
+// the engine opens it.
+func refuseUnencrypted(path string, n native, log *slog.Logger) error {
+	why, err := unencrypted(path)
+	if err == nil && why == "" {
+		return nil
+	}
+	n.Close()
+	if err != nil {
+		why = "it cannot be checked: " + err.Error()
+	}
+	log.Error("tursoraft: refused a replica the engine left unencrypted; it is not served", "path", path, "reason", why)
+	return fmt.Errorf("%w: %s: %s", ErrPlaintextReplica, path, why)
+}
+
+// unencrypted reports why the file at path is to be taken as unencrypted, or
+// "" when it is not. A file is unencrypted when it begins with the SQLite
+// header, and is taken as unencrypted when the HTTP sync protocol's companion
+// file sits beside a file too short to hold a header to judge: that protocol
+// keeps no local key, and its pages may so far be in the WAL only. An
+// encrypted file has no header at all, so a file at least a header long that
+// does not begin with it is kept, whichever protocol wrote it.
+func unencrypted(path string) (string, error) {
+	head := make([]byte, len(sqliteHeader))
+	read := 0
+	f, err := os.Open(path)
+	switch {
+	case err == nil:
+		read, err = io.ReadFull(f, head)
+		f.Close()
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return "", err
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return "", err
+	}
+	if read == len(head) && bytes.Equal(head, sqliteHeader) {
+		return "the file begins with the unencrypted SQLite header", nil
+	}
+	_, err = os.Stat(path + infoSuffix)
+	switch {
+	case err == nil && read < len(head):
+		return "the HTTP sync protocol's " + infoSuffix + " file sits beside a file with no header to judge", nil
+	case err != nil && !errors.Is(err, os.ErrNotExist):
+		return "", err
+	}
+	return "", nil
 }
 
 // openRetrying opens the engine's connector until it succeeds, fails with an
