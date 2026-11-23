@@ -1,7 +1,11 @@
 # tursoraft
 
-A process's shared and local SQL databases, and a Raft cluster per shared
-database that decides which process runs each singleton job.
+tursoraft holds a process's shared and local SQL databases, and runs a Raft
+cluster per shared database that decides which process runs each singleton job.
+
+```sh
+go get github.com/bbmumford/tursoraft
+```
 
 - **Shared database**: one authoritative copy, the *primary* (libSQL, in Turso
   Cloud or a sqld). Every process that holds it keeps an encrypted embedded
@@ -229,3 +233,51 @@ TURSORAFT_SQLD=/path/to/sqld-0.24 go test -race -count=1 -p 2 ./...
   still has a leader refuses every vote until its own timer fires, so a killed
   leader's job moves after the slowest follower's timer (1–2 s) plus the
   reassignment.
+
+## Dependencies
+
+- `github.com/bbmumford/go-libsql` (`replica`): the encrypted embedded replica
+  of a libSQL primary.
+- `github.com/bbmumford/policypool` (`localdb`, `replica`): the connection
+  pools and their foreign-key proof.
+- `turso.tech/database/tursogo` (local files), `github.com/hashicorp/raft`,
+  `github.com/hashicorp/raft-boltdb/v2`, `go.etcd.io/bbolt` and
+  `github.com/hashicorp/go-hclog` (the Raft clusters and their log store).
+- `go.mod` replaces go-libsql and policypool with the sibling checkouts
+  `../go-libsql` and `../policypool`.
+
+## Used by
+
+Importers in the ORBTR estate:
+
+- `github.com/bbmumford/loom/node` (`localdb`, `manager`, `mesh`,
+  `sqldtest`): the mesh node's databases, with loom's mesh as Raft's transport.
+- `github.com/ORBTR/Library/endpoint` (`manager`),
+  `github.com/ORBTR/Library/endpoint/jobs` (`fence`, `manager`) and
+  `endpoint/jobs/intents` (`fence`): every endpoint's databases and singleton
+  jobs.
+- `github.com/ORBTR/ai/node.orbtr.ai` (`manager`) and
+  `github.com/ORBTR/cortex/internal/sqldtest` (`sqldtest`).
+- Tests only: `github.com/ORBTR/api.orbtr.ai`,
+  `github.com/ORBTR/Library/domain/pluginhost` and
+  `github.com/ORBTR/Library/grantwrite` (`replica`, `sqldtest`).
+
+## Platforms and build
+
+Shared databases need cgo, because go-libsql is a C library: `fence`,
+`connectors` and `cmd/tursoraft-admin` build only with cgo, and in a build
+without it `replica.Supported` is false and opening a replica returns
+`ErrReplicaNeedsCGO`, so a cgo-free build compiles and opens local files only. `sqldtest` builds on Unix systems. The module's `go` directive is
+1.25.0.
+
+## Licence
+
+MIT. Copyright (c) 2026 Brandon Miller-Mumford. The full text is in
+[LICENSE](LICENSE).
+
+## Contributing
+
+[AGENTS.md](AGENTS.md) holds the repository's two rules, for people and coding
+agents alike: no temporary documents in the repository, and conventional commit
+messages that stand on their own. [CLAUDE.md](CLAUDE.md) imports it for Claude
+Code.
