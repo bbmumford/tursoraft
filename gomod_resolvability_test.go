@@ -32,6 +32,7 @@ const zeroPseudoVersion = "v0.0.0-00010101000000-000000000000"
 // go.mod gains or drops a require; this one is read against the literal
 // go.mod on every run.
 var replacedSiblings = map[string]string{
+	"github.com/bbmumford/filekind":   "v0.0.0",
 	"github.com/bbmumford/go-libsql":  "v0.0.0",
 	"github.com/bbmumford/policypool": "v0.0.0",
 }
