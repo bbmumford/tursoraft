@@ -1,9 +1,15 @@
 // Package replica keeps an encrypted embedded replica of one shared database.
 //
-// Reads are answered from the local replica file; every write is sent to the
-// primary before the call returns, so the primary alone orders writes from
-// every process holding the database. A sync loop pulls the primary's newer
-// frames into the file.
+// Reads are answered from the local replica file. A ReadWrite replica sends
+// every write to the primary before the call returns, so the primary alone
+// orders writes from every process holding the database; a ReadOnly replica
+// refuses every write before the engine sees it (go-libsql WithReadOnly). A
+// sync loop pulls the primary's newer frames into the file.
+//
+// Config is a replica's spec: its file, its primary, its mode, where its
+// credential comes from, its key and, for a scope database, the scope it must
+// hold. Every part is required and every refusal fails the open: there is no
+// default mode, no fallback to an older credential, and no wider replica.
 //
 // The pool proves foreign keys on each physical connection when it opens, and
 // refuses every statement that would turn them off, for the connection's whole
@@ -37,6 +43,7 @@ package replica
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -50,8 +57,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/bbmumford/policypool"
 
 	"github.com/bbmumford/tursoraft/database"
 	"github.com/bbmumford/tursoraft/localdb"
@@ -110,7 +115,98 @@ var (
 	// from that, or that the file could not be read to check. The engine is
 	// closed and nothing is served from the file.
 	ErrPlaintextReplica = errors.New("tursoraft/replica: the engine left the replica file unencrypted under a configured key")
+	// ErrNoMode means Config.Mode is neither ReadWrite nor ReadOnly.
+	ErrNoMode = errors.New("tursoraft/replica: the spec names no mode")
+	// ErrNoCredential means Config.Credentials is nil.
+	ErrNoCredential = errors.New("tursoraft/replica: the spec names no credential source")
+	// ErrGrantExpired means the credential's NotAfter, or its token's exp,
+	// has passed.
+	ErrGrantExpired = errors.New("tursoraft/replica: the grant has expired")
+	// ErrGrantMismatch means the credential names another database than the
+	// spec's scope.
+	ErrGrantMismatch = errors.New("tursoraft/replica: the grant is for another database")
+	// ErrWriteCapableToken means a ReadOnly spec was handed a token whose
+	// claims do not limit it to reads.
+	ErrWriteCapableToken = errors.New("tursoraft/replica: a read-only replica was handed a token that can write")
+	// ErrTokenOutlivesGrant means a ReadOnly spec was handed a token with no
+	// exp, or one whose exp lies further ahead than one grant lifetime.
+	ErrTokenOutlivesGrant = errors.New("tursoraft/replica: a read-only replica's token outlives a grant")
+	// ErrScopeMismatch means the scope database's replicaScope row is not
+	// the spec's scope, or the spec's scope is incomplete.
+	ErrScopeMismatch = errors.New("tursoraft/replica: the scope database does not hold the spec's scope")
+	// ErrReadOnlyUnproved means a ReadOnly replica's connection did not refuse
+	// the write probe itself, so its engine was not opened read-only.
+	ErrReadOnlyUnproved = errors.New("tursoraft/replica: a read-only connection did not refuse a write locally")
 )
+
+// Mode is whether a replica may send writes to its primary. The zero value
+// is no mode, and Open refuses it.
+type Mode uint8
+
+const (
+	// ReadWrite sends every write to the primary: a host's replica of a
+	// database it writes.
+	ReadWrite Mode = iota + 1
+	// ReadOnly refuses every write before the engine sees it, pulls with a
+	// read-only token and proves both at open: a device's replica of its
+	// scope databases.
+	ReadOnly
+)
+
+// GrantLifetime is the longest a read-only replica's token may run: a
+// device's sync grant lasts 15 minutes. tokenSkew is the clock difference
+// between the minting host and this one that the token check allows.
+const (
+	GrantLifetime = 15 * time.Minute
+	tokenSkew     = time.Minute
+)
+
+// Credential is what a replica authenticates its pulls with.
+type Credential struct {
+	// Token is the primary's bearer token. Empty sends none, which only a
+	// primary with authentication off accepts.
+	Token string
+	// NotAfter is when the grant ends; zero for a credential that does not
+	// expire, such as a host's static token.
+	NotAfter time.Time
+	// LeaseNotAfter is the end of the offline lease that came with the
+	// grant; zero when none came.
+	LeaseNotAfter time.Time
+	// GrantID names the grant; empty for a static credential.
+	GrantID string
+	// Database is the database the grant names; empty for a static
+	// credential. A spec with a Scope requires it to equal Scope.Database.
+	Database string
+	// Epoch is the segment's epoch the grant was issued for; zero for a
+	// static credential. The replica carries it; its holder compares it with
+	// the epoch its file records.
+	Epoch uint64
+}
+
+// CredentialSource yields the credential a replica opens with. Open calls it
+// once; the replica holds what it returned.
+type CredentialSource interface {
+	Credential(ctx context.Context) (Credential, error)
+}
+
+// StaticCredential is the source of a token that does not expire: a host's
+// per-database token released from its vault.
+func StaticCredential(token string) CredentialSource { return staticCredential(token) }
+
+type staticCredential string
+
+func (s staticCredential) Credential(context.Context) (Credential, error) {
+	return Credential{Token: string(s)}, nil
+}
+
+// Scope is the scope database a replica must hold: its name and the digest
+// its replicaScope row carries. The zero Scope is a whole database.
+type Scope struct {
+	Database string
+	Digest   []byte
+}
+
+func (s Scope) isZero() bool { return s.Database == "" && s.Digest == nil }
 
 // Config describes one replica.
 type Config struct {
@@ -118,9 +214,20 @@ type Config struct {
 	Path string
 	// URL is the primary, for example libsql://<db>-<org>.turso.io.
 	URL string
-	// AuthToken reaches the primary. Empty sends no token, which only a
-	// primary with authentication off accepts.
+	// Mode is ReadWrite or ReadOnly; there is no default.
+	Mode Mode
+	// Credentials yields the token the replica pulls with; required.
+	Credentials CredentialSource
+	// AuthToken is a static token for a ReadWrite replica, accepted for a
+	// caller that names neither Mode nor Credentials: such a Config opens
+	// ReadWrite under StaticCredential(AuthToken). Setting it beside Mode or
+	// Credentials is refused.
+	//
+	// Deprecated: set Mode: ReadWrite and Credentials: StaticCredential(token).
 	AuthToken string
+	// Scope is the scope database the replica must hold; zero for a whole
+	// database.
+	Scope Scope
 	// Key encrypts the replica file and its WAL; exactly 32 bytes.
 	Key []byte
 	// SyncInterval is the pull period; zero means DefaultSyncInterval.
@@ -183,14 +290,19 @@ type Replica struct {
 	closeErr  error
 
 	mu       sync.Mutex
+	cred     Credential
 	frame    uint64
 	lastPull time.Time
 	lastErr  error
 }
 
-// Open validates cfg, deletes a plaintext replica file, opens the replica,
-// retrying an unreachable primary until the open timeout, wraps it in a pool
-// on which every connection has foreign keys on, and starts the sync loop.
+// Open validates cfg, takes and checks its credential, deletes a plaintext
+// replica file, opens the replica, retrying an unreachable primary until the
+// open timeout, wraps it in a pool, checks a scope database's replicaScope
+// row against cfg.Scope, and starts the sync loop.
+//
+// A ReadWrite pool proves foreign keys on every connection; a ReadOnly pool
+// proves on every connection that the engine refuses a write itself.
 //
 // There is no fallback: a primary that stays unreachable fails Open, because
 // a server that served from a replica it could not open would answer from
@@ -199,6 +311,10 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 	if !Supported {
 		return nil, ErrReplicaNeedsCGO
 	}
+	cfg, err := cfg.withStaticToken()
+	if err != nil {
+		return nil, err
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -206,27 +322,38 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	cred, err := cfg.Credentials.Credential(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("tursoraft/replica: credential for %s: %w", cfg.Path, err)
+	}
+	if err := cfg.admit(cred, time.Now()); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return nil, fmt.Errorf("tursoraft/replica: %w", err)
 	}
 	if err := removePlaintext(cfg.Path, log); err != nil {
 		return nil, err
 	}
-	n, err := openRetrying(ctx, cfg, log)
+	n, err := openRetrying(ctx, cfg, cred.Token, log)
 	if err != nil {
 		return nil, err
 	}
 	if err := refuseUnencrypted(cfg.Path, n, log); err != nil {
 		return nil, err
 	}
-	db, err := policypool.OpenConnector(ctx, n, policypool.ForeignKeysRequiredAtConnect)
+	db, err := openPool(ctx, cfg.Mode, n)
 	if err != nil {
 		n.Close()
 		return nil, fmt.Errorf("tursoraft/replica: pool for %s: %w", cfg.Path, err)
 	}
 	db.SetMaxIdleConns(PoolSize)
+	if err := checkScope(ctx, db, cfg.Scope); err != nil {
+		db.Close()
+		return nil, err
+	}
 	r := &Replica{
-		cfg: cfg, log: log, interval: cfg.syncInterval(), native: n, db: db,
+		cfg: cfg, log: log, interval: cfg.syncInterval(), native: n, db: db, cred: cred,
 		reqs: make(chan chan error),
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
@@ -236,6 +363,23 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 	go r.loop()
 	return r, nil
 }
+
+// withStaticToken turns a Config that sets only AuthToken into the spec it
+// stands for: Mode ReadWrite and StaticCredential(AuthToken).
+func (c Config) withStaticToken() (Config, error) {
+	if c.AuthToken == "" {
+		return c, nil
+	}
+	if c.Mode != 0 || c.Credentials != nil {
+		return c, errMixedToken
+	}
+	c.Mode, c.Credentials = ReadWrite, StaticCredential(c.AuthToken)
+	return c, nil
+}
+
+// errMixedToken refuses a Config that sets AuthToken beside Mode or
+// Credentials, which would leave two answers to which token it pulls with.
+var errMixedToken = errors.New("tursoraft/replica: AuthToken is set beside Mode or Credentials")
 
 func (c Config) validate() error {
 	if c.Path == "" || !filepath.IsAbs(c.Path) {
@@ -247,7 +391,29 @@ func (c Config) validate() error {
 	if len(c.Key) != 32 {
 		return ErrKeyLength
 	}
+	if c.Mode != ReadWrite && c.Mode != ReadOnly {
+		return ErrNoMode
+	}
+	if c.Credentials == nil {
+		return ErrNoCredential
+	}
+	if !c.Scope.isZero() && (c.Scope.Database == "" || len(c.Scope.Digest) != sha256.Size) {
+		return fmt.Errorf("%w: a scope names its database and a %d-byte digest", ErrScopeMismatch, sha256.Size)
+	}
 	return nil
+}
+
+// admit checks a credential against the spec at now, before the engine is
+// reached: an expired grant, a grant for another database than the scope's,
+// and its token (checkToken).
+func (c Config) admit(cred Credential, now time.Time) error {
+	if !cred.NotAfter.IsZero() && !now.Before(cred.NotAfter) {
+		return fmt.Errorf("%w: its NotAfter %s has passed", ErrGrantExpired, cred.NotAfter.UTC().Format(time.RFC3339))
+	}
+	if !c.Scope.isZero() && cred.Database != c.Scope.Database {
+		return fmt.Errorf("%w: the grant names %q, the spec %q", ErrGrantMismatch, cred.Database, c.Scope.Database)
+	}
+	return c.checkToken(cred.Token, now)
 }
 
 func (c Config) syncInterval() time.Duration {
@@ -343,7 +509,7 @@ func unencrypted(path string) (string, error) {
 
 // openRetrying opens the engine's connector until it succeeds, fails with an
 // error no retry can change, or the open timeout passes.
-func openRetrying(ctx context.Context, cfg Config, log *slog.Logger) (native, error) {
+func openRetrying(ctx context.Context, cfg Config, token string, log *slog.Logger) (native, error) {
 	timeout := cfg.OpenTimeout
 	if timeout <= 0 {
 		timeout = DefaultOpenTimeout
@@ -352,7 +518,7 @@ func openRetrying(ctx context.Context, cfg Config, log *slog.Logger) (native, er
 	defer cancel()
 	backoff := 250 * time.Millisecond
 	for attempt := 1; ; attempt++ {
-		n, err := openDetached(ctx, cfg)
+		n, err := openDetached(ctx, cfg, token)
 		if err == nil {
 			return n, nil
 		}
@@ -372,14 +538,14 @@ func openRetrying(ctx context.Context, cfg Config, log *slog.Logger) (native, er
 // openDetached runs the native open, which takes no context and blocks on the
 // first pull, and stops waiting when ctx ends. An open that completes after
 // that is closed as soon as it returns.
-func openDetached(ctx context.Context, cfg Config) (native, error) {
+func openDetached(ctx context.Context, cfg Config, token string) (native, error) {
 	type result struct {
 		n   native
 		err error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		n, err := openNative(cfg)
+		n, err := openNative(cfg, token)
 		ch <- result{n, err}
 	}()
 	select {
@@ -416,8 +582,10 @@ func permanent(err error) bool {
 	return false
 }
 
-// DB returns the replica's pool. Every connection on it has foreign keys on
-// and opens write transactions with BEGIN IMMEDIATE.
+// DB returns the replica's pool. On a ReadWrite replica every connection has
+// foreign keys on and opens write transactions with BEGIN IMMEDIATE; on a
+// ReadOnly replica every connection refuses writes and BeginTx needs
+// sql.TxOptions{ReadOnly: true}.
 func (r *Replica) DB() *sql.DB { return r.db }
 
 // Stats reports the replica's sync state.

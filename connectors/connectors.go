@@ -35,8 +35,9 @@ var (
 // base64 of exactly 32 bytes. An empty key is ErrNoKey and a malformed one
 // ErrBadKey, both before anything is created on disk.
 //
-// With a primaryURL it opens an encrypted embedded replica of that primary
-// (replica.Open), which needs authToken and a cgo build. Without one it opens
+// With a primaryURL it opens an encrypted embedded ReadWrite replica of that
+// primary (replica.Open) under the static token authToken, which needs a cgo
+// build. Without one it opens
 // a local file through tursogo (localdb.Open).
 func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*database.DatabaseHandle, error) {
 	if dbPath == "" {
@@ -57,7 +58,10 @@ func MakeConnector(dbPath, primaryURL, authToken, encryptionKey string) (*databa
 	defer cancel()
 
 	if primaryURL != "" {
-		r, err := replica.Open(ctx, replica.Config{Path: path, URL: primaryURL, AuthToken: authToken, Key: key, OpenTimeout: openTimeout})
+		r, err := replica.Open(ctx, replica.Config{
+			Path: path, URL: primaryURL, Mode: replica.ReadWrite, Credentials: replica.StaticCredential(authToken),
+			Key: key, OpenTimeout: openTimeout,
+		})
 		if err != nil {
 			return nil, err
 		}

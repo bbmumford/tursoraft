@@ -42,7 +42,7 @@ func withUnencryptedEngine(t *testing.T, layout func(path string)) *atomic.Bool 
 	t.Helper()
 	closed := &atomic.Bool{}
 	saved := openNative
-	openNative = func(cfg Config) (native, error) {
+	openNative = func(cfg Config, _ string) (native, error) {
 		layout(cfg.Path)
 		c, err := libsql.NewLocalConnector(cfg.Path)
 		if err != nil {
@@ -67,7 +67,7 @@ func copyFixture(t *testing.T, to string) {
 
 func plaintextSpec(path string) Config {
 	return Config{
-		Path: path, URL: "http://127.0.0.1:1", AuthToken: "t", Key: make([]byte, 32),
+		Path: path, URL: "http://127.0.0.1:1", Mode: ReadWrite, Credentials: StaticCredential("t"), Key: make([]byte, 32),
 		SyncInterval: time.Hour, OpenTimeout: time.Second,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}

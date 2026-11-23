@@ -25,7 +25,7 @@ func replicas(t *testing.T) (a, b *replica.Replica) {
 	dir := t.TempDir()
 	open := func(name string) *replica.Replica {
 		r, err := replica.Open(context.Background(), replica.Config{
-			Path: filepath.Join(dir, name), URL: s.URL(), AuthToken: "test", Key: key,
+			Path: filepath.Join(dir, name), URL: s.URL(), Mode: replica.ReadWrite, Credentials: replica.StaticCredential("test"), Key: key,
 			SyncInterval: 200 * time.Millisecond,
 		})
 		if err != nil {

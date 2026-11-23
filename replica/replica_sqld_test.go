@@ -31,7 +31,7 @@ func newKey(t *testing.T) []byte {
 func openReplica(t *testing.T, s *sqldtest.Server, path string, key []byte) *replica.Replica {
 	t.Helper()
 	r, err := replica.Open(context.Background(), replica.Config{
-		Path: path, URL: s.URL(), AuthToken: "test", Key: key,
+		Path: path, URL: s.URL(), Mode: replica.ReadWrite, Credentials: replica.StaticCredential("test"), Key: key,
 		SyncInterval: 200 * time.Millisecond, OpenTimeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -161,7 +161,7 @@ func TestShortKeyRefused(t *testing.T) {
 func TestWrongKeyFailsAtOpen(t *testing.T) {
 	s := sqldtest.Start(t)
 	path := filepath.Join(t.TempDir(), "wrong.db")
-	r, err := replica.Open(context.Background(), replica.Config{Path: path, URL: s.URL(), AuthToken: "test", Key: newKey(t)})
+	r, err := replica.Open(context.Background(), replica.Config{Path: path, URL: s.URL(), Mode: replica.ReadWrite, Credentials: replica.StaticCredential("test"), Key: newKey(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestWrongKeyFailsAtOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	r2, err := replica.Open(context.Background(), replica.Config{Path: path, URL: s.URL(), AuthToken: "test", Key: newKey(t), OpenTimeout: 30 * time.Second})
+	r2, err := replica.Open(context.Background(), replica.Config{Path: path, URL: s.URL(), Mode: replica.ReadWrite, Credentials: replica.StaticCredential("test"), Key: newKey(t), OpenTimeout: 30 * time.Second})
 	if err == nil {
 		r2.Close()
 		t.Fatal("a replica opened under another key")
@@ -194,7 +194,7 @@ func TestBootDuringOutageFails(t *testing.T) {
 	s.Stop()
 	start := time.Now()
 	_, err := replica.Open(context.Background(), replica.Config{
-		Path: filepath.Join(t.TempDir(), "down.db"), URL: s.URL(), AuthToken: "test", Key: newKey(t),
+		Path: filepath.Join(t.TempDir(), "down.db"), URL: s.URL(), Mode: replica.ReadWrite, Credentials: replica.StaticCredential("test"), Key: newKey(t),
 		OpenTimeout: 2 * time.Second,
 	})
 	took := time.Since(start)

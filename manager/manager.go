@@ -122,7 +122,8 @@ func (m *Manager) openGroup(ctx context.Context, g GroupConfig) error {
 			r, err := replica.Open(ctx, replica.Config{
 				Path:         replicaPath(dir, g.GroupName, d.name),
 				URL:          d.url,
-				AuthToken:    d.token,
+				Mode:         replica.ReadWrite,
+				Credentials:  replica.StaticCredential(d.token),
 				Key:          keys[0],
 				SyncInterval: interval,
 				OpenTimeout:  m.cfg.OpenTimeout,

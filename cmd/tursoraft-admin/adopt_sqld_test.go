@@ -22,7 +22,7 @@ func TestFenceAdoptOnAPrimary(t *testing.T) {
 	s := sqldtest.Start(t)
 	key := make([]byte, 32)
 	rand.Read(key)
-	r, err := replica.Open(context.Background(), replica.Config{Path: filepath.Join(t.TempDir(), "r.db"), URL: s.URL(), AuthToken: "t", Key: key})
+	r, err := replica.Open(context.Background(), replica.Config{Path: filepath.Join(t.TempDir(), "r.db"), URL: s.URL(), Mode: replica.ReadWrite, Credentials: replica.StaticCredential("t"), Key: key})
 	if err != nil {
 		t.Fatal(err)
 	}

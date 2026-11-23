@@ -12,10 +12,20 @@
 // The binary is $TURSORAFT_SQLD, else the newest of /opt/homebrew/bin/sqld,
 // sqld on PATH and each ~/.local/share/libsql-server/<version>/sqld (see
 // Binary); with none the test is skipped.
+//
+// Start runs sqld with authentication off. StartWithAuth runs it with JWT
+// authentication under a fresh Ed25519 key, for the tests of what a token
+// lets a replica do; its Signer mints the tokens.
 package sqldtest
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +47,8 @@ type Server struct {
 	bin     string
 	dir     string
 	addr    string
-	Version string // e.g. "0.24.32"
+	args    []string // added to every start, Restart included
+	Version string   // e.g. "0.24.32"
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -162,6 +173,49 @@ func newer(a, b [3]int) bool {
 // Start starts sqld and stops it when the test ends.
 func Start(t testing.TB) *Server {
 	t.Helper()
+	return start(t, nil)
+}
+
+// Signer mints the tokens a Server from StartWithAuth accepts.
+type Signer struct{ key ed25519.PrivateKey }
+
+// Token returns an EdDSA JWT with claims as its payload, signed by the key
+// the server verifies with. sqld reads "a" (ro, rw or roa), "p" (scopes),
+// "id" (a namespace) and "exp"; a token with no "a" and no "p" has full
+// access.
+func (s *Signer) Token(claims map[string]any) string {
+	enc := base64.RawURLEncoding
+	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT"})
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		panic(fmt.Sprintf("sqldtest: claims do not encode: %v", err))
+	}
+	signing := enc.EncodeToString(header) + "." + enc.EncodeToString(payload)
+	return signing + "." + enc.EncodeToString(ed25519.Sign(s.key, []byte(signing)))
+}
+
+// StartWithAuth starts sqld with --auth-jwt-key-file holding the public half
+// of a new Ed25519 key, so every request needs a token the returned Signer
+// minted. sqld checks a token's exp with a 60 s leeway.
+func StartWithAuth(t testing.TB) (*Server, *Signer) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "jwt.pem")
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return start(t, []string{"--auth-jwt-key-file", keyFile}), &Signer{key: priv}
+}
+
+func start(t testing.TB, args []string) *Server {
+	t.Helper()
 	bin := Binary()
 	if bin == "" {
 		t.Skip("no sqld: set TURSORAFT_SQLD")
@@ -172,7 +226,7 @@ func Start(t testing.TB) *Server {
 	}
 	addr := l.Addr().String()
 	l.Close()
-	s := &Server{t: t, bin: bin, dir: t.TempDir(), addr: addr}
+	s := &Server{t: t, bin: bin, dir: t.TempDir(), addr: addr, args: args}
 	s.start()
 	t.Cleanup(s.Stop)
 	return s
@@ -187,7 +241,7 @@ func (s *Server) start() {
 	if err != nil {
 		s.t.Fatal(err)
 	}
-	cmd := exec.Command(s.bin, "--no-welcome", "--db-path", filepath.Join(s.dir, "data.sqld"), "--http-listen-addr", s.addr)
+	cmd := exec.Command(s.bin, append([]string{"--no-welcome", "--db-path", filepath.Join(s.dir, "data.sqld"), "--http-listen-addr", s.addr}, s.args...)...)
 	cmd.Stdout, cmd.Stderr = logf, logf
 	if err := cmd.Start(); err != nil {
 		logf.Close()

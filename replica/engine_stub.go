@@ -6,4 +6,6 @@ package replica
 // engine is a C library, so a build without cgo cannot.
 const Supported = false
 
-func openEngine(Config) (native, error) { return nil, ErrReplicaNeedsCGO }
+func openEngine(Config, string) (native, error) { return nil, ErrReplicaNeedsCGO }
+
+func refusedLocally(error) bool { return false }

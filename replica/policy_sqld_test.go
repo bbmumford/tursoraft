@@ -24,7 +24,7 @@ import (
 // does. This pins both measurements the replica's read path depends on.
 func TestPolicyProofReachesThePrimary(t *testing.T) {
 	s := sqldtest.Start(t)
-	cfg := Config{Path: filepath.Join(t.TempDir(), "p.db"), URL: s.URL(), AuthToken: "test", Key: make([]byte, 32)}
+	cfg := Config{Path: filepath.Join(t.TempDir(), "p.db"), URL: s.URL(), Mode: ReadWrite, Credentials: StaticCredential("test"), Key: make([]byte, 32)}
 	r, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestPolicyProofReachesThePrimary(t *testing.T) {
 func TestTheGuardHoldsForeignKeysOnAReplicaPool(t *testing.T) {
 	s := sqldtest.Start(t)
 	ctx := context.Background()
-	r, err := Open(ctx, Config{Path: filepath.Join(t.TempDir(), "g.db"), URL: s.URL(), AuthToken: "test", Key: make([]byte, 32)})
+	r, err := Open(ctx, Config{Path: filepath.Join(t.TempDir(), "g.db"), URL: s.URL(), Mode: ReadWrite, Credentials: StaticCredential("test"), Key: make([]byte, 32)})
 	if err != nil {
 		t.Fatal(err)
 	}

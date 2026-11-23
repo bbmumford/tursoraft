@@ -1,11 +1,7 @@
 # tursoraft
 
-tursoraft holds a process's shared and local SQL databases, and runs a Raft
-cluster per shared database that decides which process runs each singleton job.
-
-```sh
-go get github.com/bbmumford/tursoraft
-```
+A process's shared and local SQL databases, and a Raft cluster per shared
+database that decides which process runs each singleton job.
 
 - **Shared database**: one authoritative copy, the *primary* (libSQL, in Turso
   Cloud or a sqld). Every process that holds it keeps an encrypted embedded
@@ -30,13 +26,13 @@ boot.
 | Package | What it is |
 |---|---|
 | `manager` | `NewManager`, `Database`, `Job`, `Leader`, `Sync`, `SyncOnMiss`, `SyncStats`, `Health`, `Shutdown`, and the deprecated `IsLeader` |
-| `replica` | One encrypted embedded replica: open with retry, plaintext checks before and after the open, sync loop, stats (cgo; a stub without) |
+| `replica` | One encrypted embedded replica from its spec (`Config`: mode, credential source, scope, key): the token check, open with retry, plaintext checks before and after the open, the read-only pool, sync loop, stats (cgo; a stub without) |
 | `localdb` | One encrypted tursogo file through policypool |
 | `fence` | `Fence.Tx`: epoch-fenced write transactions |
 | `mesh`, `mesh/meshtest` | The transport contract Raft runs over, and test meshes |
 | `connectors` | `MakeConnector`, one encrypted handle outside a Manager |
 | `database` | `DatabaseHandle` and `SyncStats` |
-| `sqldtest` | Starts a local sqld for a test that needs a primary |
+| `sqldtest` | Starts a local sqld for a test that needs a primary; `StartWithAuth` runs it under JWT authentication with a `Signer` for its tokens |
 | `cmd/tursoraft-admin` | Operator tool: `ensure`, `token`, `fence-adopt` |
 
 Every `*sql.DB` tursoraft returns comes from `policypool`, and on every
@@ -103,7 +99,8 @@ kinds ever share a path:
 
 ## Boot
 
-1. Validate, with no network.
+1. Validate, with no network. Every shared database's replica is `ReadWrite`
+   under the static token its config carries (`replica.StaticCredential`).
 2. For each shared database: with a key configured, a replica file that begins
    with the plaintext SQLite header is deleted (it is a cache).
 3. Open the replica (`WithEncryption`, `WithReadYourWrites`, `WithRawText`,
@@ -121,6 +118,19 @@ kinds ever share a path:
 6. `Database()` works from here and never waits for Raft.
 7. Start each Raft cluster this process has a seat in.
 8. The endpoint applies its schema, calls `Sync`, then serves.
+
+## Read-only replicas
+
+A device's replica of a scope database opens with `Mode: replica.ReadOnly`, a
+`CredentialSource` handing out its grants and the `Scope` it must hold. Before
+the engine is reached, `Open` refuses a spec with no mode or credential source,
+a credential with no token, an expired grant or token, and a token whose claims
+are not read-only (`a` must be `ro`, `p` may hold only `ro` and `roa`, `exp`
+must lie within one 15-minute grant plus a minute, and every namespace it names
+must be the scope's database). After the open, the scope database's
+`replicaScope` row must carry the spec's digest. go-libsql's `WithReadOnly`
+gate refuses every statement it would send to the primary, and every pooled
+connection proves it refuses a write itself before it is used.
 
 ## Jobs
 
@@ -219,51 +229,3 @@ TURSORAFT_SQLD=/path/to/sqld-0.24 go test -race -count=1 -p 2 ./...
   still has a leader refuses every vote until its own timer fires, so a killed
   leader's job moves after the slowest follower's timer (1–2 s) plus the
   reassignment.
-
-## Dependencies
-
-- `github.com/bbmumford/go-libsql` (`replica`): the encrypted embedded replica
-  of a libSQL primary.
-- `github.com/bbmumford/policypool` (`localdb`, `replica`): the connection
-  pools and their foreign-key proof.
-- `turso.tech/database/tursogo` (local files), `github.com/hashicorp/raft`,
-  `github.com/hashicorp/raft-boltdb/v2`, `go.etcd.io/bbolt` and
-  `github.com/hashicorp/go-hclog` (the Raft clusters and their log store).
-- `go.mod` replaces go-libsql and policypool with the sibling checkouts
-  `../go-libsql` and `../policypool`.
-
-## Used by
-
-Importers in the ORBTR estate:
-
-- `github.com/bbmumford/loom/node` (`localdb`, `manager`, `mesh`,
-  `sqldtest`): the mesh node's databases, with loom's mesh as Raft's transport.
-- `github.com/ORBTR/Library/endpoint` (`manager`),
-  `github.com/ORBTR/Library/endpoint/jobs` (`fence`, `manager`) and
-  `endpoint/jobs/intents` (`fence`): every endpoint's databases and singleton
-  jobs.
-- `github.com/ORBTR/ai/node.orbtr.ai` (`manager`) and
-  `github.com/ORBTR/cortex/internal/sqldtest` (`sqldtest`).
-- Tests only: `github.com/ORBTR/api.orbtr.ai`,
-  `github.com/ORBTR/Library/domain/pluginhost` and
-  `github.com/ORBTR/Library/grantwrite` (`replica`, `sqldtest`).
-
-## Platforms and build
-
-Shared databases need cgo, because go-libsql is a C library: `fence`,
-`connectors` and `cmd/tursoraft-admin` build only with cgo, and in a build
-without it `replica.Supported` is false and opening a replica returns
-`ErrReplicaNeedsCGO`, so a cgo-free build compiles and opens local files only. `sqldtest` builds on Unix systems. The module's `go` directive is
-1.25.0.
-
-## Licence
-
-MIT. Copyright (c) 2026 Brandon Miller-Mumford. The full text is in
-[LICENSE](LICENSE).
-
-## Contributing
-
-[AGENTS.md](AGENTS.md) holds the repository's two rules, for people and coding
-agents alike: no temporary documents in the repository, and conventional commit
-messages that stand on their own. [CLAUDE.md](CLAUDE.md) imports it for Claude
-Code.
