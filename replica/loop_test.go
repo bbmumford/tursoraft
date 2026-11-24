@@ -61,7 +61,7 @@ func (c closingConnector) Close() error          { return c.f.Close() }
 
 func newLoopReplica(f *fakeNative, interval time.Duration) *Replica {
 	r := &Replica{
-		cfg: Config{Path: "/fake"}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), interval: interval, native: f,
+		cfg: Config{Path: "/fake"}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), interval: interval, engine: f,
 		db:   sql.OpenDB(closingConnector{f}),
 		reqs: make(chan chan error), stop: make(chan struct{}), done: make(chan struct{}),
 		lastPull: time.Now(),

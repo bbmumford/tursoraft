@@ -33,7 +33,7 @@ func TestPolicyProofReachesThePrimary(t *testing.T) {
 	if _, err := r.DB().Exec("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1)"); err != nil {
 		t.Fatal(err)
 	}
-	raw := sql.OpenDB(r.native)
+	raw := sql.OpenDB(r.engine)
 	raw.SetMaxOpenConns(1)
 	conn, err := raw.Conn(context.Background())
 	if err != nil {
@@ -93,7 +93,7 @@ func TestTheGuardHoldsForeignKeysOnAReplicaPool(t *testing.T) {
 		t.Errorf("the pool's orphan write got %v, want a foreign-key failure", err)
 	}
 
-	raw := sql.OpenDB(r.native)
+	raw := sql.OpenDB(r.engine)
 	raw.SetMaxOpenConns(1)
 	conn, err := raw.Conn(ctx)
 	if err != nil {

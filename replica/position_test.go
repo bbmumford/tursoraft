@@ -46,7 +46,7 @@ func bounded(t *testing.T) context.Context {
 func newPositionReplica(p *progressEngine, interval time.Duration) *Replica {
 	r := &Replica{
 		cfg: Config{Path: "/fake", Scope: Scope{Database: "orbtr-r-fake", Digest: make([]byte, 32)}},
-		log: slog.New(slog.NewTextHandler(io.Discard, nil)), interval: interval, native: p,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)), interval: interval, engine: p,
 		db:   sql.OpenDB(closingConnector{&p.fakeNative}),
 		reqs: make(chan chan error), stop: make(chan struct{}), done: make(chan struct{}),
 		lastPull: time.Now(),

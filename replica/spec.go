@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -125,11 +126,11 @@ func (c Config) checkToken(token string, now time.Time) error {
 // connections that never write needs instead: the foreign-key proof's
 // PRAGMA foreign_keys is a statement libSQL sends to the primary, so the
 // read-only gate refuses it.
-func openPool(ctx context.Context, mode Mode, n native) (*sql.DB, error) {
+func openPool(ctx context.Context, mode Mode, base driver.Connector) (*sql.DB, error) {
 	if mode == ReadWrite {
-		return policypool.OpenConnector(ctx, n, policypool.ForeignKeysRequiredAtConnect)
+		return policypool.OpenConnector(ctx, base, policypool.ForeignKeysRequiredAtConnect)
 	}
-	db := sql.OpenDB(readOnlyConnector{n})
+	db := sql.OpenDB(readOnlyConnector{base})
 	c, err := db.Conn(ctx)
 	if err != nil {
 		db.Close()
@@ -149,10 +150,10 @@ const readOnlyProbe = "DELETE FROM sqlite_schema WHERE 0"
 // readOnlyConnector is a ReadOnly replica's pool connector: every connection
 // it hands to database/sql has refused readOnlyProbe with the engine's own
 // read-only refusal (refusedLocally).
-type readOnlyConnector struct{ n native }
+type readOnlyConnector struct{ base driver.Connector }
 
 func (c readOnlyConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	conn, err := c.n.Connect(ctx)
+	conn, err := c.base.Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -171,11 +172,16 @@ func (c readOnlyConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	return conn, nil
 }
 
-func (c readOnlyConnector) Driver() driver.Driver { return c.n.Driver() }
+func (c readOnlyConnector) Driver() driver.Driver { return c.base.Driver() }
 
 // Close closes the engine when the pool closes, as policypool's connector
 // does for a ReadWrite pool.
-func (c readOnlyConnector) Close() error { return c.n.Close() }
+func (c readOnlyConnector) Close() error {
+	if closer, ok := c.base.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
 
 // checkScope reads a scope database's replicaScope row and requires exactly
 // one, carrying scope.Digest. A whole-database spec (the zero Scope) checks

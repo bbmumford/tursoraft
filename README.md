@@ -137,6 +137,14 @@ must be the scope's database). After the open, the scope database's
 gate refuses every statement it would send to the primary, and every pooled
 connection proves it refuses a write itself before it is used.
 
+A credential with a `NotAfter` is renewed two thirds into its life (10 minutes
+into a 15-minute grant): between pulls, inside the sync loop, the replica asks
+its source again, closes the engine and opens it on the same file under the
+new token, then checks the file as after any open. Callers waiting for a pull
+keep waiting, and pooled connections of the replaced engine are retired as they
+come back. A grant that ends unrenewed stops every pull with
+`replica.ErrGrantExpired`; the replica never pulls under an older grant.
+
 A scope replica records its source position, the `sourceCursor` of its
 `replicaProgress` row, after every pull. `RequestPull(ctx, atLeastPosition)`
 asks the sync loop for pulls, sharing them with every other caller, until the

@@ -152,6 +152,7 @@ func TestAdmitCredential(t *testing.T) {
 type fakeEngine struct {
 	execErr error // what a connection's ExecContext returns
 	closed  atomic.Bool
+	syncs   atomic.Int64
 }
 
 func (f *fakeEngine) Connect(context.Context) (driver.Conn, error) {
@@ -159,7 +160,7 @@ func (f *fakeEngine) Connect(context.Context) (driver.Conn, error) {
 }
 func (f *fakeEngine) Driver() driver.Driver { return nil }
 func (f *fakeEngine) Close() error          { f.closed.Store(true); return nil }
-func (f *fakeEngine) Sync() (uint64, error) { return 1, nil }
+func (f *fakeEngine) Sync() (uint64, error) { f.syncs.Add(1); return 1, nil }
 
 type fakeConn struct{ execErr error }
 

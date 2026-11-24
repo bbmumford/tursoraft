@@ -57,6 +57,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bbmumford/tursoraft/database"
@@ -251,6 +252,9 @@ type Stats struct {
 	Stale bool
 	// Err is the last pull's error, nil when it succeeded.
 	Err error
+	// LeaseNotAfter is the offline lease that came with the newest grant the
+	// replica holds; zero when none came.
+	LeaseNotAfter time.Time
 }
 
 // SyncStats maps s onto the shape database.SyncStats keeps.
@@ -280,11 +284,20 @@ type Replica struct {
 	cfg      Config
 	log      *slog.Logger
 	interval time.Duration
-	native   native
 	db       *sql.DB
 	// readPosition reads the source position the scope database records;
 	// nil for a whole database.
 	readPosition func(context.Context) (uint64, error)
+	drv          driver.Driver
+
+	// emu guards engine and failed. The loop replaces the engine under it;
+	// currentConnector holds it shared while it connects, so no connection is
+	// ever made on an engine being closed. gen counts the engines the loop has
+	// put in place; a connection made on an earlier one is retired.
+	emu    sync.RWMutex
+	engine native // nil while the loop reopens it
+	failed error  // set when a reopened engine was refused; final
+	gen    atomic.Uint64
 
 	reqs chan chan error
 	stop chan struct{}
@@ -297,6 +310,7 @@ type Replica struct {
 	cred     Credential
 	position uint64
 	watchers []chan uint64
+	renewAt  time.Time // zero for a credential that does not expire
 	frame    uint64
 	lastPull time.Time
 	lastErr  error
@@ -329,6 +343,7 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 		log = slog.Default()
 	}
 	cred, err := cfg.Credentials.Credential(ctx)
+	fetched := time.Now()
 	if err != nil {
 		return nil, fmt.Errorf("tursoraft/replica: credential for %s: %w", cfg.Path, err)
 	}
@@ -348,7 +363,16 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 	if err := refuseUnencrypted(cfg.Path, n, log); err != nil {
 		return nil, err
 	}
-	db, err := openPool(ctx, cfg.Mode, n)
+	r := &Replica{
+		cfg: cfg, log: log, interval: cfg.syncInterval(), engine: n, drv: n.Driver(),
+		cred: cred, renewAt: renewalTime(cred, fetched),
+		reqs: make(chan chan error),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+		// The engine pulled once inside the open.
+		lastPull: time.Now(),
+	}
+	db, err := openPool(ctx, cfg.Mode, currentConnector{r})
 	if err != nil {
 		n.Close()
 		return nil, fmt.Errorf("tursoraft/replica: pool for %s: %w", cfg.Path, err)
@@ -358,14 +382,7 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 		db.Close()
 		return nil, err
 	}
-	r := &Replica{
-		cfg: cfg, log: log, interval: cfg.syncInterval(), native: n, db: db, cred: cred,
-		reqs: make(chan chan error),
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
-		// The engine pulled once inside the open.
-		lastPull: time.Now(),
-	}
+	r.db = db
 	if !cfg.Scope.isZero() {
 		r.readPosition = func(ctx context.Context) (uint64, error) { return queryPosition(ctx, db, cfg.Scope.Digest) }
 		p, err := r.readPosition(ctx)
@@ -681,10 +698,11 @@ func (r *Replica) Stats() Stats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Stats{
-		Frame:    r.frame,
-		LastPull: r.lastPull,
-		Stale:    time.Since(r.lastPull) > staleAfter*r.interval,
-		Err:      r.lastErr,
+		Frame:         r.frame,
+		LastPull:      r.lastPull,
+		Stale:         time.Since(r.lastPull) > staleAfter*r.interval,
+		Err:           r.lastErr,
+		LeaseNotAfter: r.cred.LeaseNotAfter,
 	}
 }
 
@@ -716,12 +734,27 @@ func (r *Replica) Sync(ctx context.Context) error {
 }
 
 // loop runs every pull: one per sync interval, jittered, and one for each
-// batch of Sync callers. It is the only goroutine that calls the native pull,
-// so no pull runs concurrently with another or with the connector's close.
+// batch of Sync callers, and every grant renewal (renew). It is the only
+// goroutine that calls the native pull or replaces the engine, so no pull
+// runs concurrently with another, with a renewal or with the connector's
+// close, and callers waiting for a pull keep waiting across a renewal.
 func (r *Replica) loop() {
 	defer close(r.done)
 	next := time.NewTimer(0)
 	defer next.Stop()
+	renew := time.NewTimer(time.Hour)
+	renew.Stop()
+	defer renew.Stop()
+	armRenew := func() {
+		renew.Stop()
+		r.mu.Lock()
+		at := r.renewAt
+		r.mu.Unlock()
+		if !at.IsZero() {
+			renew.Reset(time.Until(at))
+		}
+	}
+	armRenew()
 	var gap <-chan time.Time
 	var waiting []chan error
 	var lastStart time.Time
@@ -739,6 +772,9 @@ func (r *Replica) loop() {
 			due = true
 		case <-gap:
 			gap = nil
+		case <-renew.C:
+			r.renew()
+			armRenew()
 		}
 		if !due && len(waiting) > 0 {
 			if wait := SyncGap - time.Since(lastStart); wait > 0 {
@@ -792,7 +828,11 @@ func (r *Replica) jittered() time.Duration {
 }
 
 func (r *Replica) pull() error {
-	frame, err := r.native.Sync()
+	n, err := r.engineForPull()
+	var frame uint64
+	if err == nil {
+		frame, err = n.Sync()
+	}
 	r.mu.Lock()
 	failing := r.lastErr != nil
 	if err == nil {
@@ -814,8 +854,8 @@ func (r *Replica) pull() error {
 }
 
 // Close stops the sync loop and then closes the pool, which closes the
-// connector. The order matters: closing the connector while a pull runs on it
-// frees memory the pull is using.
+// engine through currentConnector. The order matters: closing the engine
+// while a pull runs on it frees memory the pull is using.
 func (r *Replica) Close() error {
 	r.closeOnce.Do(func() {
 		close(r.stop)
