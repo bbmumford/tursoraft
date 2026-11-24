@@ -252,8 +252,9 @@ TURSORAFT_SQLD=/path/to/sqld-0.24 go test -race -count=1 -p 2 ./...
 - `turso.tech/database/tursogo` (local files), `github.com/hashicorp/raft`,
   `github.com/hashicorp/raft-boltdb/v2`, `go.etcd.io/bbolt` and
   `github.com/hashicorp/go-hclog` (the Raft clusters and their log store).
-- `go.mod` replaces go-libsql and policypool with the sibling checkouts
-  `../go-libsql` and `../policypool`.
+- `go.mod` replaces go-libsql, policypool and filekind (which policypool
+  imports) with the sibling checkouts `../go-libsql`, `../policypool` and
+  `../filekind`.
 
 ## Used by
 
