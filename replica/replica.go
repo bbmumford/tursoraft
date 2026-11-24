@@ -281,6 +281,9 @@ type Replica struct {
 	interval time.Duration
 	native   native
 	db       *sql.DB
+	// readPosition reads the source position the scope database records;
+	// nil for a whole database.
+	readPosition func(context.Context) (uint64, error)
 
 	reqs chan chan error
 	stop chan struct{}
@@ -291,6 +294,8 @@ type Replica struct {
 
 	mu       sync.Mutex
 	cred     Credential
+	position uint64
+	watchers []chan uint64
 	frame    uint64
 	lastPull time.Time
 	lastErr  error
@@ -360,6 +365,15 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 		// The engine pulled once inside the open.
 		lastPull: time.Now(),
 	}
+	if !cfg.Scope.isZero() {
+		r.readPosition = func(ctx context.Context) (uint64, error) { return queryPosition(ctx, db, cfg.Scope.Digest) }
+		p, err := r.readPosition(ctx)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("%w: %s records no source position: %v", ErrScopeMismatch, cfg.Scope.Database, err)
+		}
+		r.position = p
+	}
 	go r.loop()
 	return r, nil
 }
@@ -414,6 +428,13 @@ func (c Config) admit(cred Credential, now time.Time) error {
 		return fmt.Errorf("%w: the grant names %q, the spec %q", ErrGrantMismatch, cred.Database, c.Scope.Database)
 	}
 	return c.checkToken(cred.Token, now)
+}
+
+func (r *Replica) openTimeout() time.Duration {
+	if r.cfg.OpenTimeout > 0 {
+		return r.cfg.OpenTimeout
+	}
+	return DefaultOpenTimeout
 }
 
 func (c Config) syncInterval() time.Duration {
@@ -718,6 +739,9 @@ func (r *Replica) pull() error {
 		r.log.Warn("tursoraft: replica pull failed; writes fail until the primary answers", "path", r.cfg.Path, "err", err)
 	case err == nil && failing:
 		r.log.Info("tursoraft: replica pull recovered", "path", r.cfg.Path, "frame", frame)
+	}
+	if err == nil {
+		r.refreshPosition()
 	}
 	return err
 }

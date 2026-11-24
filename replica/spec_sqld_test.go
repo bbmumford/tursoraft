@@ -173,6 +173,13 @@ func TestReadOnlyScopeIsChecked(t *testing.T) {
 	if _, err := w.DB().Exec("INSERT INTO replicaScope (scopeDigest, partitionId) VALUES (?, 'p1')", digest); err != nil {
 		t.Fatal(err)
 	}
+	// A scope replica also reads its source position at open.
+	if _, err := w.DB().Exec("CREATE TABLE replicaProgress (scopeDigest BLOB PRIMARY KEY CHECK (length(scopeDigest) = 32), sourceCursor INTEGER NOT NULL DEFAULT 0) STRICT"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.DB().Exec("INSERT INTO replicaProgress (scopeDigest) VALUES (?)", digest); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := openSpec(t, spec("matching", digest, "orbtr-r-test")); err != nil {
 		t.Errorf("the matching scope: err = %v", err)

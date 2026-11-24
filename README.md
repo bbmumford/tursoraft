@@ -36,6 +36,7 @@ boot.
 | `mesh`, `mesh/meshtest` | The transport contract Raft runs over, and test meshes |
 | `connectors` | `MakeConnector`, one encrypted handle outside a Manager |
 | `database` | `DatabaseHandle` and `SyncStats` |
+| `pull` | The pull-trigger port, `pull.Trigger`: `RequestPull(ctx, segment, atLeastPosition)`; no dependency beyond the standard library |
 | `sqldtest` | Starts a local sqld for a test that needs a primary; `StartWithAuth` runs it under JWT authentication with a `Signer` for its tokens |
 | `cmd/tursoraft-admin` | Operator tool: `ensure`, `token`, `fence-adopt` |
 
@@ -135,6 +136,14 @@ must be the scope's database). After the open, the scope database's
 `replicaScope` row must carry the spec's digest. go-libsql's `WithReadOnly`
 gate refuses every statement it would send to the primary, and every pooled
 connection proves it refuses a write itself before it is used.
+
+A scope replica records its source position, the `sourceCursor` of its
+`replicaProgress` row, after every pull. `RequestPull(ctx, atLeastPosition)`
+asks the sync loop for pulls, sharing them with every other caller, until the
+replica records that position, and `Position` and `WatchPosition` read and
+follow it. `replica.Set` holds a device's replicas by database name and
+implements `pull.Trigger` over them, so a subscription that learns of a change
+at a source position brings the segment's replica up to it.
 
 ## Jobs
 
