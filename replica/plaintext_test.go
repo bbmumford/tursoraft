@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -95,32 +96,54 @@ func TestOpenRefusesAReplicaLeftUnencrypted(t *testing.T) {
 	}
 }
 
-// libSQL's HTTP sync protocol keeps no local key; its companion file beside a
-// replica file with no header yet is refused too.
-func TestOpenRefusesAnHTTPSyncReplicaWithNoHeader(t *testing.T) {
+// walWithPageOne writes a WAL of page size 4096 whose frames hold the pages
+// named, page 1's bytes beginning with first.
+func walWithPageOne(t *testing.T, path string, pages []uint32, first []byte) {
+	t.Helper()
+	const pageSize = 4096
+	b := make([]byte, 32)
+	binary.BigEndian.PutUint32(b[0:4], 0x377f0682)
+	binary.BigEndian.PutUint32(b[4:8], 3007000)
+	binary.BigEndian.PutUint32(b[8:12], pageSize)
+	for _, pg := range pages {
+		frame := make([]byte, 24+pageSize)
+		binary.BigEndian.PutUint32(frame[0:4], pg)
+		rand.Read(frame[24:])
+		if pg == 1 {
+			copy(frame[24:], first)
+		}
+		b = append(b, frame...)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Before the engine has written page 1 into the database file it may hold it
+// only in the WAL; a plaintext page 1 there is refused too.
+func TestOpenRefusesAReplicaWhosePageOneIsUnencryptedInTheWAL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "r.db")
 	closed := withUnencryptedEngine(t, func(p string) {
-		for _, f := range []string{p, p + infoSuffix} {
-			if err := os.WriteFile(f, nil, 0o600); err != nil {
-				t.Fatal(err)
-			}
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
 		}
+		walWithPageOne(t, p+"-wal", []uint32{1}, sqliteHeader)
 	})
 	r, err := Open(context.Background(), plaintextSpec(path))
 	if r != nil {
 		r.Close()
-		t.Fatalf("Open served a replica beside %s with no header, err = %v", infoSuffix, err)
+		t.Fatalf("Open served a replica whose page 1 in the WAL is unencrypted, err = %v", err)
 	}
-	if !errors.Is(err, ErrPlaintextReplica) || !strings.Contains(err.Error(), infoSuffix) {
-		t.Errorf("err = %v, want ErrPlaintextReplica naming %s", err, infoSuffix)
+	if !errors.Is(err, ErrPlaintextReplica) || !strings.Contains(err.Error(), "WAL") {
+		t.Errorf("err = %v, want ErrPlaintextReplica naming the WAL", err)
 	}
 	if !closed.Load() {
 		t.Error("the engine was left open")
 	}
 }
 
-func TestUnencryptedJudgesTheHeaderAndTheInfoFile(t *testing.T) {
+func TestUnencryptedJudgesPageOne(t *testing.T) {
 	random := make([]byte, 4096)
 	rand.Read(random)
 	fixture, err := os.ReadFile(filepath.Join("testdata", "plaintext-replica.db"))
@@ -129,18 +152,24 @@ func TestUnencryptedJudgesTheHeaderAndTheInfoFile(t *testing.T) {
 	}
 	cases := []struct {
 		name    string
-		main    []byte // nil: no file
-		info    bool
+		main    []byte   // nil: no file
+		info    bool     // the HTTP sync protocol's -info file beside it
+		wal     []uint32 // the pages of a WAL beside it, none: no WAL
+		walHead []byte   // the bytes page 1 begins with in that WAL
 		refused bool
 	}{
-		{"unencrypted", fixture, false, true},
-		{"unencrypted, HTTP sync", fixture, true, true},
-		{"empty, HTTP sync", []byte{}, true, true},
-		{"missing, HTTP sync", nil, true, true},
-		{"short, HTTP sync", fixture[:10], true, true},
-		{"encrypted, HTTP sync", random, true, false},
-		{"encrypted", random, false, false},
-		{"empty", []byte{}, false, false},
+		{name: "unencrypted file", main: fixture, refused: true},
+		{name: "unencrypted file, -info", main: fixture, info: true, refused: true},
+		{name: "encrypted file", main: random},
+		{name: "encrypted file, -info (a keyed HTTP sync replica)", main: random, info: true},
+		{name: "empty file, -info, no WAL", main: []byte{}, info: true},
+		{name: "no file, -info, no WAL", info: true},
+		{name: "empty file, unencrypted page 1 in the WAL", main: []byte{}, wal: []uint32{1}, walHead: sqliteHeader, refused: true},
+		{name: "no file, unencrypted page 1 after page 2 in the WAL", wal: []uint32{2, 1}, walHead: sqliteHeader, refused: true},
+		{name: "empty file, encrypted page 1 in the WAL", main: []byte{}, wal: []uint32{1}, walHead: random[:16]},
+		{name: "empty file, a WAL without page 1", main: []byte{}, wal: []uint32{2, 3}},
+		{name: "short file, unencrypted page 1 in the WAL", main: fixture[:10], wal: []uint32{1}, walHead: sqliteHeader, refused: true},
+		{name: "encrypted file, unencrypted page 1 in the WAL", main: random, wal: []uint32{1}, walHead: sqliteHeader},
 	}
 	for _, tc := range cases {
 		dir := t.TempDir()
@@ -151,9 +180,12 @@ func TestUnencryptedJudgesTheHeaderAndTheInfoFile(t *testing.T) {
 			}
 		}
 		if tc.info {
-			if err := os.WriteFile(path+infoSuffix, []byte("{}"), 0o600); err != nil {
+			if err := os.WriteFile(path+"-info", []byte("{}"), 0o600); err != nil {
 				t.Fatal(err)
 			}
+		}
+		if tc.wal != nil {
+			walWithPageOne(t, path+"-wal", tc.wal, tc.walHead)
 		}
 		why, err := unencrypted(path)
 		if err != nil || (why != "") != tc.refused {
@@ -161,9 +193,22 @@ func TestUnencryptedJudgesTheHeaderAndTheInfoFile(t *testing.T) {
 		}
 	}
 
-	// A path that cannot be read as a file is not passed as encrypted.
+	// A file that is not a WAL is not read as one.
 	dir := t.TempDir()
-	unreadable := filepath.Join(dir, "r.db")
+	path := filepath.Join(dir, "r.db")
+	b := make([]byte, 32+24+4096)
+	binary.BigEndian.PutUint32(b[8:12], 4096)
+	binary.BigEndian.PutUint32(b[32:36], 1)
+	copy(b[32+24:], sqliteHeader)
+	if err := os.WriteFile(path+"-wal", b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if why, err := unencrypted(path); err != nil || why != "" {
+		t.Errorf("a -wal without the WAL magic: why=%q err=%v, want kept", why, err)
+	}
+
+	// A path that cannot be read as a file is not passed as encrypted.
+	unreadable := filepath.Join(t.TempDir(), "r.db")
 	if err := os.Mkdir(unreadable, 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -46,6 +46,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -472,10 +473,6 @@ func removePlaintext(path string, log *slog.Logger) error {
 // sqliteHeader begins every unencrypted SQLite database file.
 var sqliteHeader = []byte("SQLite format 3\x00")
 
-// infoSuffix names the companion file libSQL's HTTP sync protocol keeps
-// beside a replica; the frame-replication protocol never writes it.
-const infoSuffix = "-info"
-
 // refuseUnencrypted checks the replica file the engine has just opened and
 // pulled into, and closes the engine and refuses when the file is to be taken
 // as unencrypted (unencrypted). The file is left where it is: the next Open's
@@ -494,38 +491,108 @@ func refuseUnencrypted(path string, n native, log *slog.Logger) error {
 	return fmt.Errorf("%w: %s: %s", ErrPlaintextReplica, path, why)
 }
 
-// unencrypted reports why the file at path is to be taken as unencrypted, or
-// "" when it is not. A file is unencrypted when it begins with the SQLite
-// header, and is taken as unencrypted when the HTTP sync protocol's companion
-// file sits beside a file too short to hold a header to judge: that protocol
-// keeps no local key, and its pages may so far be in the WAL only. An
-// encrypted file has no header at all, so a file at least a header long that
-// does not begin with it is kept, whichever protocol wrote it.
+// unencrypted reports why the replica at path is to be taken as unencrypted,
+// or "" when it is not. Page 1 of an unencrypted SQLite database begins with
+// the SQLite header and an encrypted one's does not, so page 1 is judged
+// wherever it is: in the database file, or, before the engine has written it
+// there, in the first WAL frame that holds it. A replica with page 1 in
+// neither has written no page, and is kept. Neither the HTTP sync protocol's
+// -info file nor any other companion is judged: a keyed replica on that
+// protocol keeps one beside an encrypted database file.
 func unencrypted(path string) (string, error) {
-	head := make([]byte, len(sqliteHeader))
-	read := 0
-	f, err := os.Open(path)
-	switch {
-	case err == nil:
-		read, err = io.ReadFull(f, head)
-		f.Close()
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			return "", err
+	head, err := readHead(path, 0)
+	if err != nil {
+		return "", err
+	}
+	if len(head) == len(sqliteHeader) {
+		if bytes.Equal(head, sqliteHeader) {
+			return "the database file begins with the unencrypted SQLite header", nil
 		}
-	case !errors.Is(err, os.ErrNotExist):
+		return "", nil
+	}
+	head, err = walPageOne(path + "-wal")
+	if err != nil {
 		return "", err
 	}
-	if read == len(head) && bytes.Equal(head, sqliteHeader) {
-		return "the file begins with the unencrypted SQLite header", nil
-	}
-	_, err = os.Stat(path + infoSuffix)
-	switch {
-	case err == nil && read < len(head):
-		return "the HTTP sync protocol's " + infoSuffix + " file sits beside a file with no header to judge", nil
-	case err != nil && !errors.Is(err, os.ErrNotExist):
-		return "", err
+	if bytes.Equal(head, sqliteHeader) {
+		return "page 1 in the WAL begins with the unencrypted SQLite header", nil
 	}
 	return "", nil
+}
+
+// readHead reads up to a header's length of the file at path from offset; a
+// missing file reads as nothing.
+func readHead(path string, offset int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	head := make([]byte, len(sqliteHeader))
+	n, err := f.ReadAt(head, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return head[:n], nil
+}
+
+// WAL layout: a 32-byte header that begins with one of two magic numbers and
+// carries the page size at offset 8 (1 meaning 65536), then frames of a
+// 24-byte header, whose first four bytes are the page number, and one page.
+const (
+	walHeaderSize      = 32
+	walFrameHeaderSize = 24
+)
+
+// walPageOne returns the first bytes of page 1 as the first WAL frame holding
+// it carries them, or nothing when the file at path is missing, is not a WAL,
+// or holds no frame of page 1.
+func walPageOne(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	hdr := make([]byte, walHeaderSize)
+	if _, err := f.ReadAt(hdr, 0); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if magic := binary.BigEndian.Uint32(hdr[0:4]); magic != 0x377f0682 && magic != 0x377f0683 {
+		return nil, nil
+	}
+	pageSize := int64(binary.BigEndian.Uint32(hdr[8:12]))
+	if pageSize == 1 {
+		pageSize = 65536
+	}
+	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 {
+		return nil, nil
+	}
+	frame := make([]byte, walFrameHeaderSize)
+	for off := int64(walHeaderSize); ; off += walFrameHeaderSize + pageSize {
+		if _, err := f.ReadAt(frame, off); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if binary.BigEndian.Uint32(frame[0:4]) == 1 {
+			head := make([]byte, len(sqliteHeader))
+			n, err := f.ReadAt(head, off+walFrameHeaderSize)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return nil, err
+			}
+			return head[:n], nil
+		}
+	}
 }
 
 // openRetrying opens the engine's connector until it succeeds, fails with an

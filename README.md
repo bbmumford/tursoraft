@@ -111,10 +111,10 @@ kinds ever share a path:
 3. Open the replica (`WithEncryption`, `WithReadYourWrites`, `WithRawText`,
    `WithImmediateTransactions`), retrying an unreachable primary for the open
    timeout (60 s), then fail. There is no fallback. Then check the file the
-   engine wrote: one that begins with the plaintext SQLite header, or that is
-   too short to judge beside the `-info` file libSQL's HTTP sync protocol
-   writes, is refused with `replica.ErrPlaintextReplica` and nothing is served
-   from it, because a primary that answers that protocol makes the engine open
+   engine wrote: one whose page 1, in the database file or still only in the
+   WAL, begins with the plaintext SQLite header is refused with
+   `replica.ErrPlaintextReplica` and nothing is served from it, because a
+   primary that answers libSQL's HTTP sync protocol can make the engine open
    the file without its key.
 4. Wrap it with `policypool.OpenConnector(…, ForeignKeysRequiredAtConnect)`,
    keeping up to `replica.PoolSize` (8) proved connections idle, and start its
