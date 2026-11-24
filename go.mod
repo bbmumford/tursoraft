@@ -10,7 +10,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	go.etcd.io/bbolt v1.3.5
 	go.uber.org/goleak v1.3.0
-	turso.tech/database/tursogo v0.8.0-pre.12
+	turso.tech/database/tursogo v0.8.4
 )
 
 require (
@@ -28,7 +28,7 @@ require (
 	github.com/libsql/sqlite-antlr4-parser v0.0.0-20240327125255-dbf53b6cbf06 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/tursodatabase/turso-go-platform-libs v0.8.0-pre.12 // indirect
+	github.com/tursodatabase/turso-go-platform-libs v0.8.4 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	golang.org/x/exp v0.0.0-20240325151524-a685a6edb6d8 // indirect
 	golang.org/x/sys v0.44.0 // indirect
