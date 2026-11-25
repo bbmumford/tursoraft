@@ -26,6 +26,8 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/bbmumford/filekind"
+	"github.com/bbmumford/policypool"
 	"github.com/bbmumford/tursoraft/database"
 	"github.com/bbmumford/tursoraft/internal/cluster"
 	"github.com/bbmumford/tursoraft/localdb"
@@ -100,6 +102,12 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	return m, nil
 }
 
+// localIdentity is the file identity of a pure-local group's databases:
+// filekind's tursoraftLocal kind, generation 1. A new file is stamped with it
+// and any other file is refused with policypool.ErrFileIdentity: such a file is
+// authoritative, so the group fails to open rather than lose its rows.
+var localIdentity = policypool.Identity{Kind: filekind.TursoraftLocal, Generation: 1}
+
 func (m *Manager) openGroup(ctx context.Context, g GroupConfig) error {
 	keys, err := g.keys()
 	if err != nil {
@@ -113,7 +121,7 @@ func (m *Manager) openGroup(ctx context.Context, g GroupConfig) error {
 	for _, d := range g.databases() {
 		h := &holding{group: g.GroupName, name: d.name}
 		if g.PureLocal {
-			db, err := localdb.Open(ctx, localPath(dir, g.GroupName, d.name), keys[0])
+			db, err := localdb.OpenFile(ctx, localPath(dir, g.GroupName, d.name), keys[0], localIdentity)
 			if err != nil {
 				return fmt.Errorf("tursoraft: group %q database %q: %w", g.GroupName, d.name, err)
 			}

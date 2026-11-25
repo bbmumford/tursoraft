@@ -120,7 +120,10 @@ kinds ever share a path:
 4. Wrap it with `policypool.OpenConnector(…, ForeignKeysRequiredAtConnect)`,
    keeping up to `replica.PoolSize` (8) proved connections idle, and start its
    sync loop (every sync interval, default 5 s, jittered ±20%).
-5. Open local databases through tursogo, encrypted, through policypool.
+5. Open local databases through tursogo, encrypted, through policypool, each
+   stamped with filekind's `tursoraftLocal` kind when new and refused under any
+   other header (`localdb.OpenFile`; loom's LAD file opens the same way as
+   `lad`).
 6. `Database()` works from here and never waits for Raft.
 7. Start each Raft cluster this process has a seat in.
 8. The endpoint applies its schema, calls `Sync`, then serves.

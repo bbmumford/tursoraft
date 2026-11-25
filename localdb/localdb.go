@@ -1,11 +1,13 @@
 // Package localdb opens a database file that one process owns, through the
 // tursogo engine, encrypted at rest and pooled by policypool.
 //
-// Consumed by the Manager for a pureLocal group's databases, by
-// connectors.MakeConnector, by loom's node runtime for its LAD file, and by
-// the replica package, which calls IsPlaintext before it opens a replica. A
-// local file is authoritative: nothing else holds its rows, so nothing here
-// ever deletes one.
+// Consumed by the Manager for a pureLocal group's databases (OpenFile, kind
+// tursoraftLocal), by connectors.MakeConnector (Open), by loom's node runtime
+// for its LAD file (OpenFile, kind lad), and by the replica package, which
+// calls IsPlaintext before it opens a replica. One opener serves several
+// kinds of file, so the kind comes from the caller. A local file is
+// authoritative: nothing else holds its rows, so nothing here ever deletes
+// one.
 package localdb
 
 import (
@@ -67,7 +69,33 @@ func Open(ctx context.Context, path string, key []byte) (*sql.DB, error) {
 	} else if plain {
 		return nil, fmt.Errorf("%w: %s", ErrPlaintext, path)
 	}
-	return open(ctx, path, DSN(path, key))
+	return open(ctx, path, DSN(path, key), nil)
+}
+
+// OpenFile is Open for a file that carries identity in its header
+// (policypool.OpenFile): a new file is stamped with identity's kind and
+// generation once, however many openers race; a file of that kind at a
+// generation identity reads opens; any other file, one stamped with another
+// kind or generation or an unstamped one that already holds a schema, is
+// refused with policypool.ErrFileIdentity and left as it is. Every connection
+// of the pool then refuses a statement assigning application_id or
+// user_version.
+//
+// A refusal is the caller's to act on by what the file is: a cache's opener
+// rebuilds it, an authoritative file's opener stops and reports it.
+func OpenFile(ctx context.Context, path string, key []byte, identity policypool.Identity) (*sql.DB, error) {
+	if len(key) != KeyLen {
+		return nil, ErrKeyLength
+	}
+	if err := prepare(path); err != nil {
+		return nil, err
+	}
+	if plain, err := IsPlaintext(path); err != nil {
+		return nil, err
+	} else if plain {
+		return nil, fmt.Errorf("%w: %s", ErrPlaintext, path)
+	}
+	return open(ctx, path, DSN(path, key), &identity)
 }
 
 func prepare(path string) error {
@@ -77,8 +105,15 @@ func prepare(path string) error {
 	return os.MkdirAll(filepath.Dir(path), 0o700)
 }
 
-func open(ctx context.Context, path, dsn string) (*sql.DB, error) {
-	db, err := policypool.Open(ctx, "turso", dsn, policypool.ForeignKeysRequired)
+// open opens the pool, through policypool.OpenFile when identity is set.
+func open(ctx context.Context, path, dsn string, identity *policypool.Identity) (*sql.DB, error) {
+	var db *sql.DB
+	var err error
+	if identity == nil {
+		db, err = policypool.Open(ctx, "turso", dsn, policypool.ForeignKeysRequired)
+	} else {
+		db, err = policypool.OpenFile(ctx, "turso", dsn, policypool.ForeignKeysRequired, *identity)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("tursoraft/localdb: open %s: %w", path, err)
 	}

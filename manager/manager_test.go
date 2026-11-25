@@ -10,8 +10,35 @@ import (
 
 	"go.uber.org/goleak"
 
+	"github.com/bbmumford/filekind"
 	"github.com/bbmumford/tursoraft/database"
 )
+
+// TestLocalGroupDatabasesCarryTheirKind: a pureLocal group's database file is
+// stamped tursoraftLocal, generation 1, when the group first opens it, and the
+// next open of the same directory opens it again under that kind.
+func TestLocalGroupDatabasesCarryTheirKind(t *testing.T) {
+	dir := t.TempDir()
+	cfg := ManagerConfig{
+		Groups:     []GroupConfig{{GroupName: "mesh", DBNames: []string{"store"}, PureLocal: true, EncryptionKey: b64Key()}},
+		RaftConfig: RaftConfig{LocalDir: dir},
+	}
+	for open := 1; open <= 2; open++ {
+		m, err := NewManager(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("open %d: %v", open, err)
+		}
+		db, err := m.Database("mesh", "store")
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := filekind.Read(context.Background(), db)
+		m.Shutdown()
+		if err != nil || h != (filekind.Header{ApplicationID: filekind.TursoraftLocal.ApplicationID(), UserVersion: 1}) {
+			t.Fatalf("open %d: header = %+v, %v, want tursoraftLocal generation 1", open, h, err)
+		}
+	}
+}
 
 // A pureLocal group opens encrypted local files that work at once; they have
 // no replica to report on; with no raft block IsLeader is true; and Shutdown
