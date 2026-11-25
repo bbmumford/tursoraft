@@ -106,8 +106,9 @@ kinds ever share a path:
 
 1. Validate, with no network. Every shared database's replica is `ReadWrite`
    under the static token its config carries (`replica.StaticCredential`).
-2. For each shared database: with a key configured, a replica file that begins
-   with the plaintext SQLite header is deleted (it is a cache).
+2. For each shared database: with a key configured, a replica whose page 1, in
+   the database file or still only in the WAL, begins with the plaintext SQLite
+   header is deleted with its companion files (it is a cache).
 3. Open the replica (`WithEncryption`, `WithReadYourWrites`, `WithRawText`,
    `WithImmediateTransactions`), retrying an unreachable primary for the open
    timeout (60 s), then fail. There is no fallback. Then check the file the

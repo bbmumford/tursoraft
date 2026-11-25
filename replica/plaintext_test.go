@@ -143,6 +143,56 @@ func TestOpenRefusesAReplicaWhosePageOneIsUnencryptedInTheWAL(t *testing.T) {
 	}
 }
 
+// The next Open deletes a replica refused for an unencrypted page 1 in the
+// WAL, with its companions, before the engine opens it, as it does one whose
+// database file begins with the header; a WAL whose page 1 is encrypted is
+// kept.
+func TestOpenDeletesAReplicaWhosePageOneIsUnencryptedInTheWAL(t *testing.T) {
+	random := make([]byte, 16)
+	rand.Read(random)
+	for _, tc := range []struct {
+		name    string
+		walHead []byte
+		deleted bool
+	}{
+		{name: "unencrypted page 1 in the WAL", walHead: sqliteHeader, deleted: true},
+		{name: "encrypted page 1 in the WAL", walHead: random},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "r.db")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			walWithPageOne(t, path+"-wal", []uint32{1}, tc.walHead)
+			if err := os.WriteFile(path+"-info", []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var left []string
+			withUnencryptedEngine(t, func(p string) {
+				for _, suffix := range []string{"-wal", "-info"} {
+					if _, err := os.Stat(p + suffix); err == nil {
+						left = append(left, suffix)
+					}
+				}
+			})
+			r, err := Open(context.Background(), plaintextSpec(path))
+			if r != nil {
+				r.Close()
+			}
+			if tc.deleted {
+				if len(left) != 0 {
+					t.Fatalf("the engine opened beside the refused replica's %v, want it deleted first", left)
+				}
+				if err != nil {
+					t.Fatalf("Open after the deletion: %v", err)
+				}
+			} else if len(left) != 2 {
+				t.Fatalf("the engine opened beside %v, want the replica with an encrypted page 1 kept", left)
+			}
+		})
+	}
+}
+
 func TestUnencryptedJudgesPageOne(t *testing.T) {
 	random := make([]byte, 4096)
 	rand.Read(random)

@@ -28,11 +28,12 @@
 // before it: the pool keeps up to PoolSize of them idle and retires none for
 // age.
 //
-// The engine is handed the key on every open, yet when the primary answers
-// libSQL's HTTP sync protocol the engine opens the file without it and writes
-// it unencrypted. So the file is checked after every open, and a file left
-// unencrypted is closed and refused (ErrPlaintextReplica): it is never
-// served.
+// The engine is handed the key on every open, yet a libSQL build that does not
+// carry the key through its HTTP sync protocol, which the engine takes
+// whenever the primary answers it, opens the file without it and writes it
+// unencrypted. So the file is checked after every open, and a file left
+// unencrypted is closed and refused (ErrPlaintextReplica): it is never served,
+// and the next Open deletes it before the engine opens it again.
 //
 // Consumed by the Manager for every database of a shared group, and by
 // connectors.MakeConnector given a primary URL. The replica file is a cache:
@@ -61,7 +62,6 @@ import (
 	"time"
 
 	"github.com/bbmumford/tursoraft/database"
-	"github.com/bbmumford/tursoraft/localdb"
 )
 
 // Defaults and bounds.
@@ -468,14 +468,17 @@ func (c Config) syncInterval() time.Duration {
 var replicaFiles = []string{"", "-wal", "-shm", "-client_wal_index", "-info"}
 
 // removePlaintext deletes the replica and its companion files when the
-// database file begins with the plaintext SQLite header. The engine would
-// otherwise open it unencrypted, or fail on it, under a configured key.
+// replica is to be taken as unencrypted (unencrypted), the judgement
+// refuseUnencrypted makes after an open, so every replica it refused is
+// replaced here, whether its unencrypted page 1 is in the database file or
+// only in the WAL. The engine would otherwise open it unencrypted, or fail on
+// it, under a configured key.
 func removePlaintext(path string, log *slog.Logger) error {
-	plain, err := localdb.IsPlaintext(path)
+	why, err := unencrypted(path)
 	if err != nil {
 		return fmt.Errorf("tursoraft/replica: check %s: %w", path, err)
 	}
-	if !plain {
+	if why == "" {
 		return nil
 	}
 	for _, suffix := range replicaFiles {
@@ -483,7 +486,7 @@ func removePlaintext(path string, log *slog.Logger) error {
 			return fmt.Errorf("tursoraft/replica: remove plaintext replica: %w", err)
 		}
 	}
-	log.Warn("tursoraft: deleted a plaintext replica found under a configured key; it downloads again", "path", path)
+	log.Warn("tursoraft: deleted a plaintext replica found under a configured key; it downloads again", "path", path, "reason", why)
 	return nil
 }
 
@@ -493,8 +496,7 @@ var sqliteHeader = []byte("SQLite format 3\x00")
 // refuseUnencrypted checks the replica file the engine has just opened and
 // pulled into, and closes the engine and refuses when the file is to be taken
 // as unencrypted (unencrypted). The file is left where it is: the next Open's
-// removePlaintext deletes one that begins with the unencrypted header before
-// the engine opens it.
+// removePlaintext deletes it before the engine opens it.
 func refuseUnencrypted(path string, n native, log *slog.Logger) error {
 	why, err := unencrypted(path)
 	if err == nil && why == "" {
