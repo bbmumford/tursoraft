@@ -108,7 +108,7 @@ func TestTokenCheck(t *testing.T) {
 		{"whole database, id names one", ro, unsignedToken(map[string]any{"a": "ro", "exp": in(time.Minute), "id": "orbtr-r-bb"}), nil},
 	}
 	for _, tc := range cases {
-		err := tc.cfg.checkToken(tc.token, now)
+		err := tc.cfg.checkToken(tc.token, "", now)
 		if tc.want == nil && err != nil || tc.want != nil && !errors.Is(err, tc.want) {
 			t.Errorf("%s: err = %v, want %v", tc.name, err, tc.want)
 		}
@@ -141,6 +141,37 @@ func TestAdmitCredential(t *testing.T) {
 	}
 	for _, tc := range cases {
 		err := tc.cfg.admit(tc.cred, now)
+		if tc.want == nil && err != nil || tc.want != nil && !errors.Is(err, tc.want) {
+			t.Errorf("%s: err = %v, want %v", tc.name, err, tc.want)
+		}
+	}
+}
+
+// TestGrantNamesTheDatabaseByThePrimarysID holds the token check to the claims
+// Turso mints: a database token's only database claim is "id", Turso's own id
+// for the database (measured on minted tokens: keys a, exp, iat, id, kid, rid),
+// so a grant for a scope database carries that id beside the name.
+func TestGrantNamesTheDatabaseByThePrimarysID(t *testing.T) {
+	now := time.Now()
+	scope := Config{Mode: ReadOnly, Scope: Scope{Database: "orbtr-r-aa", Digest: make([]byte, 32)}}
+	turso := func(id string) string {
+		return unsignedToken(map[string]any{"a": "ro", "exp": now.Add(15 * time.Minute).Unix(), "iat": now.Unix(), "id": id, "kid": "k", "rid": "r"})
+	}
+	const idA, idB = "01a21312-5401-7f20-a59e-97d786c52a9d", "01a21312-6701-7dbc-ad94-8ccd1f35bd7c"
+	cases := []struct {
+		name string
+		cred Credential
+		want error
+	}{
+		{"id is the grant's database id", Credential{Token: turso(idA), Database: "orbtr-r-aa", DatabaseID: idA}, nil},
+		{"id is another database's id", Credential{Token: turso(idB), Database: "orbtr-r-aa", DatabaseID: idA}, ErrGrantMismatch},
+		{"grant carries no database id", Credential{Token: turso(idA), Database: "orbtr-r-aa"}, ErrGrantMismatch},
+		{"ns names the grant's database id", Credential{Token: unsignedToken(map[string]any{"a": "ro", "exp": now.Add(time.Minute).Unix(), "p": map[string]any{"ro": map[string]any{"ns": []string{idA}}}}), Database: "orbtr-r-aa", DatabaseID: idA}, nil},
+		{"ns names another id", Credential{Token: unsignedToken(map[string]any{"a": "ro", "exp": now.Add(time.Minute).Unix(), "p": map[string]any{"ro": map[string]any{"ns": []string{idA, idB}}}}), Database: "orbtr-r-aa", DatabaseID: idA}, ErrGrantMismatch},
+		{"id names the scope by name, any database id", Credential{Token: turso("orbtr-r-aa"), Database: "orbtr-r-aa", DatabaseID: idB}, nil},
+	}
+	for _, tc := range cases {
+		err := scope.admit(tc.cred, now)
 		if tc.want == nil && err != nil || tc.want != nil && !errors.Is(err, tc.want) {
 			t.Errorf("%s: err = %v, want %v", tc.name, err, tc.want)
 		}

@@ -179,6 +179,12 @@ type Credential struct {
 	// Database is the database the grant names; empty for a static
 	// credential. A spec with a Scope requires it to equal Scope.Database.
 	Database string
+	// DatabaseID is the primary's own identifier for Database, which a
+	// primary's minted tokens may name the database by instead of its name:
+	// Turso's database tokens carry it as their "id" claim. Empty for a
+	// static credential and for a primary whose tokens name the database by
+	// name, as sqld's namespace tokens do.
+	DatabaseID string
 	// Epoch is the segment's epoch the grant was issued for; zero for a
 	// static credential. The replica carries it; its holder compares it with
 	// the epoch its file records.
@@ -445,7 +451,7 @@ func (c Config) admit(cred Credential, now time.Time) error {
 	if !c.Scope.isZero() && cred.Database != c.Scope.Database {
 		return fmt.Errorf("%w: the grant names %q, the spec %q", ErrGrantMismatch, cred.Database, c.Scope.Database)
 	}
-	return c.checkToken(cred.Token, now)
+	return c.checkToken(cred.Token, cred.DatabaseID, now)
 }
 
 func (r *Replica) openTimeout() time.Duration {

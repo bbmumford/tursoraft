@@ -54,8 +54,11 @@ func decodeClaims(token string) (claims tokenClaims, ok bool) {
 // one grant lifetime: "a" is "ro"; "p", when present, holds only the "ro" and
 // "roa" scopes (ErrWriteCapableToken); "exp" is present and no further ahead
 // than GrantLifetime plus tokenSkew (ErrTokenOutlivesGrant); and for a scope
-// database, every namespace its "id" and its scopes' "ns" lists name is that
-// database (ErrGrantMismatch).
+// database, every database its "id" and its scopes' "ns" lists name is that
+// database, named by Scope.Database or by the grant's databaseID
+// (ErrGrantMismatch). sqld's tokens name a namespace by name; Turso's minted
+// database tokens name the database only by Turso's id for it, which the
+// holder cannot derive from the scope, so the grant carries it.
 //
 // The read-only checks are the third of a read-only replica's refusals of a
 // write, beside the statement gate and the primary's own refusal of a write
@@ -63,7 +66,7 @@ func decodeClaims(token string) (claims tokenClaims, ok bool) {
 // one grant lifetime; and the namespace check stands because the primary's
 // replication path accepts a token signed by its key for any namespace it
 // serves, whichever namespace the token names.
-func (c Config) checkToken(token string, now time.Time) error {
+func (c Config) checkToken(token, databaseID string, now time.Time) error {
 	if token == "" {
 		return fmt.Errorf("%w: the credential carries no token", ErrNoCredential)
 	}
@@ -100,8 +103,9 @@ func (c Config) checkToken(token string, now time.Time) error {
 	if c.Scope.isZero() {
 		return nil
 	}
-	if claims.ID != nil && *claims.ID != c.Scope.Database {
-		return fmt.Errorf("%w: the token's id claim names %q, the spec %q", ErrGrantMismatch, *claims.ID, c.Scope.Database)
+	names := func(db string) bool { return db == c.Scope.Database || databaseID != "" && db == databaseID }
+	if claims.ID != nil && !names(*claims.ID) {
+		return fmt.Errorf("%w: the token's id claim names %q, the spec %q and the grant's database id %q", ErrGrantMismatch, *claims.ID, c.Scope.Database, databaseID)
 	}
 	for scope, raw := range claims.P {
 		var body struct {
@@ -111,8 +115,8 @@ func (c Config) checkToken(token string, now time.Time) error {
 			return fmt.Errorf("%w: its %q scope does not decode", ErrWriteCapableToken, scope)
 		}
 		for _, ns := range body.NS {
-			if ns != c.Scope.Database {
-				return fmt.Errorf("%w: the token's %q scope names %q, the spec %q", ErrGrantMismatch, scope, ns, c.Scope.Database)
+			if !names(ns) {
+				return fmt.Errorf("%w: the token's %q scope names %q, the spec %q and the grant's database id %q", ErrGrantMismatch, scope, ns, c.Scope.Database, databaseID)
 			}
 		}
 	}
