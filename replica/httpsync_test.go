@@ -305,3 +305,75 @@ func TestTheNextOpenReplacesAPlaintextReplicaOnHTTPSync(t *testing.T) {
 		t.Fatalf("plaintext rows left on disk: %v", leaks)
 	}
 }
+
+// A renewal closes the real engine and opens it again on the same keyed files
+// under the new token; the file checked after each swap is kept, and the
+// replica goes on pulling and serving its rows.
+func TestRenewalKeepsAKeyedReplicaOnHTTPSync(t *testing.T) {
+	url := httpSyncPrimary(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "r.db")
+	src := &mintingSource{life: 3 * time.Second}
+	spec := httpSyncSpec(path, url, httpSyncKey(t))
+	spec.Credentials, spec.SyncInterval = src, 100*time.Millisecond
+	r, err := Open(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for r.gen.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d engine swaps after 30 s, want 2 (credential calls %d)", r.gen.Load(), src.calls.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	r.emu.RLock()
+	failed := r.failed
+	r.emu.RUnlock()
+	if failed != nil {
+		t.Fatalf("a reopened engine was refused: %v", failed)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := r.Sync(ctx); err != nil {
+		t.Fatalf("a pull after the swaps: %v", err)
+	}
+	if n := httpSyncCount(t, r.DB(), httpSyncFrameMarker); n != httpSyncRows {
+		t.Fatalf("after the swaps the replica reads %d rows, want %d", n, httpSyncRows)
+	}
+	requireHTTPSyncLayout(t, path, false)
+	if leaks := httpSyncLeaks(t, dir); len(leaks) != 0 {
+		t.Fatalf("plaintext rows on disk: %v", leaks)
+	}
+}
+
+// Every read that opens a new pool connection while the loop pulls is
+// answered: the engine's refusals of a connection while a pull holds the
+// database are waited out.
+func TestNewConnectionsOpenWhileTheLoopPullsOnHTTPSync(t *testing.T) {
+	url := httpSyncPrimary(t)
+	spec := httpSyncSpec(filepath.Join(t.TempDir(), "r.db"), url, httpSyncKey(t))
+	spec.SyncInterval = 5 * time.Millisecond
+	r, err := Open(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	r.DB().SetMaxIdleConns(0)
+	failed := 0
+	var first error
+	for i := 0; i < 300; i++ {
+		var n int
+		if err := r.DB().QueryRow("SELECT count(*) FROM t").Scan(&n); err != nil {
+			failed++
+			if first == nil {
+				first = err
+			}
+		}
+	}
+	if failed != 0 {
+		t.Fatalf("%d of 300 reads on a new connection failed while the loop pulled; the first: %v", failed, first)
+	}
+}

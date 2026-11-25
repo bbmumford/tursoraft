@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -122,7 +124,45 @@ func (r *Replica) engineForPull() (native, error) {
 // engine held then, which db.Close calls after the loop has stopped.
 type currentConnector struct{ r *Replica }
 
+// connectBusyWait bounds how long Connect waits out an engine that refuses a
+// new connection because the database is locked. On libSQL's HTTP sync path
+// the engine runs a statement as it opens each connection, and SQLite refuses
+// it with "database is locked" while the loop's pull holds the database; every
+// renewal swap retires the pool's connections, so the reads after it open new
+// ones while the loop pulls. Tests shorten it.
+var connectBusyWait = 5 * time.Second
+
+// Connect opens a connection on the current engine (connectOnce), opening it
+// again, with backoff and without holding emu, while the engine refuses
+// because the database is locked, until connectBusyWait has passed or ctx
+// ends; any other refusal is returned at once.
 func (c currentConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	deadline := time.Now().Add(connectBusyWait)
+	backoff := 2 * time.Millisecond
+	for {
+		conn, err := c.connectOnce(ctx)
+		if err == nil || !databaseLocked(err) || !time.Now().Before(deadline) {
+			return conn, err
+		}
+		wait := time.NewTimer(min(backoff, time.Until(deadline)))
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+			return nil, fmt.Errorf("%w (the engine refused the connection: %v)", ctx.Err(), err)
+		case <-wait.C:
+		}
+		backoff = min(backoff*2, 50*time.Millisecond)
+	}
+}
+
+// databaseLocked reports whether err is SQLite's refusal while another
+// connection holds the database.
+func databaseLocked(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "database is locked")
+}
+
+// connectOnce opens one connection on the engine the replica holds now.
+func (c currentConnector) connectOnce(ctx context.Context) (driver.Conn, error) {
 	r := c.r
 	r.emu.RLock()
 	defer r.emu.RUnlock()
