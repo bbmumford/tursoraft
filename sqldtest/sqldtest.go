@@ -199,6 +199,17 @@ func (s *Signer) Token(claims map[string]any) string {
 // minted. sqld checks a token's exp with a 60 s leeway.
 func StartWithAuth(t testing.TB) (*Server, *Signer) {
 	t.Helper()
+	return StartWithAuthFrom(t, "")
+}
+
+// StartWithAuthFrom is StartWithAuth over a primary whose default database
+// starts as a copy of the SQLite file at seed, its header included; an empty
+// seed starts an empty database. sqld refuses PRAGMA application_id and
+// user_version as statements, so a seeded file is how a primary's page 1
+// carries a file identity, as a scope database created from a stamped file
+// does.
+func StartWithAuthFrom(t testing.TB, seed string) (*Server, *Signer) {
+	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -211,10 +222,17 @@ func StartWithAuth(t testing.TB) (*Server, *Signer) {
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return start(t, []string{"--auth-jwt-key-file", keyFile}), &Signer{key: priv}
+	return startFrom(t, []string{"--auth-jwt-key-file", keyFile}, seed), &Signer{key: priv}
 }
 
 func start(t testing.TB, args []string) *Server {
+	t.Helper()
+	return startFrom(t, args, "")
+}
+
+// startFrom starts sqld on a new data directory whose default database is a
+// copy of seed, when seed is not empty.
+func startFrom(t testing.TB, args []string, seed string) *Server {
 	t.Helper()
 	bin := Binary()
 	if bin == "" {
@@ -227,6 +245,19 @@ func start(t testing.TB, args []string) *Server {
 	addr := l.Addr().String()
 	l.Close()
 	s := &Server{t: t, bin: bin, dir: t.TempDir(), addr: addr, args: args}
+	if seed != "" {
+		data, err := os.ReadFile(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbs := filepath.Join(s.dir, "data.sqld", "dbs", "default")
+		if err := os.MkdirAll(dbs, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dbs, "data"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	s.start()
 	t.Cleanup(s.Stop)
 	return s

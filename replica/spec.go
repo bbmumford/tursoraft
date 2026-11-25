@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bbmumford/filekind"
 	"github.com/bbmumford/policypool"
 )
 
@@ -123,16 +124,37 @@ func (c Config) checkToken(token, databaseID string, now time.Time) error {
 	return nil
 }
 
-// openPool wraps the engine's connector in the pool a mode needs and proves
-// its first connection. ReadWrite proves foreign keys on every connection
-// (policypool.ForeignKeysRequiredAtConnect). ReadOnly proves on every
-// connection that the engine refuses a write itself, which a pool of
-// connections that never write needs instead: the foreign-key proof's
-// PRAGMA foreign_keys is a statement libSQL sends to the primary, so the
-// read-only gate refuses it.
-func openPool(ctx context.Context, mode Mode, base driver.Connector) (*sql.DB, error) {
-	if mode == ReadWrite {
-		return policypool.OpenConnector(ctx, base, policypool.ForeignKeysRequiredAtConnect)
+// scopeIdentity is the file identity every scope database carries in its
+// header: filekind's scopeReplica kind at the scope database format this
+// package reads. The primary is stamped once, when the scope database is
+// created, and a replica's page 1 is its primary's, so a replica is checked
+// against it and never stamped (CheckOnly): an unstamped replica means its
+// primary was never stamped, and a stamp on the copy alone would be taken away
+// by the primary's next page 1.
+var scopeIdentity = policypool.Identity{Kind: filekind.ScopeReplica, Generation: scopeGeneration, CheckOnly: true}
+
+// scopeGeneration is the scope database format generation this package reads:
+// filekind's registry row for scopeReplica (TestScopeIdentityIsTheRegistrysRow
+// holds the two together).
+const scopeGeneration = 1
+
+// openPool wraps the engine's connector in the pool a spec needs, proves its
+// first connection and, for a scope database, checks the file identity.
+// ReadWrite proves foreign keys on every connection
+// (policypool.ForeignKeysRequiredAtConnect), through OpenFileConnector with
+// scopeIdentity for a scope database, so its connections also refuse every
+// header assignment. ReadOnly proves on every connection that the engine
+// refuses a write itself, which a pool of connections that never write needs
+// instead: the foreign-key proof's PRAGMA foreign_keys is a statement libSQL
+// sends to the primary, so the read-only gate refuses it, and policypool checks
+// that pool's file with CheckIdentity. A refused identity is
+// policypool.ErrFileIdentity, with the pool closed.
+func openPool(ctx context.Context, cfg Config, base driver.Connector) (*sql.DB, error) {
+	if cfg.Mode == ReadWrite {
+		if cfg.Scope.isZero() {
+			return policypool.OpenConnector(ctx, base, policypool.ForeignKeysRequiredAtConnect)
+		}
+		return policypool.OpenFileConnector(ctx, base, policypool.ForeignKeysRequiredAtConnect, scopeIdentity)
 	}
 	db := sql.OpenDB(readOnlyConnector{base})
 	c, err := db.Conn(ctx)
@@ -141,6 +163,12 @@ func openPool(ctx context.Context, mode Mode, base driver.Connector) (*sql.DB, e
 		return nil, err
 	}
 	c.Close()
+	if !cfg.Scope.isZero() {
+		if err := policypool.CheckIdentity(ctx, db, scopeIdentity); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	return db, nil
 }
 

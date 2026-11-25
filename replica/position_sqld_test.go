@@ -11,7 +11,6 @@ import (
 
 	"github.com/bbmumford/tursoraft/pull"
 	"github.com/bbmumford/tursoraft/replica"
-	"github.com/bbmumford/tursoraft/sqldtest"
 )
 
 // A scope database's writer advances replicaProgress.sourceCursor in the
@@ -19,7 +18,7 @@ import (
 // read-only replica whose timed pull is an hour away reaches the position
 // only through RequestPull, and holds the rows when it returns.
 func TestRequestPullReturnsAtThePosition(t *testing.T) {
-	s, signer := sqldtest.StartWithAuth(t)
+	s, signer := startScopePrimary(t)
 	dir := t.TempDir()
 	ctx := context.Background()
 	digest := make([]byte, 32)

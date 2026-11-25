@@ -53,7 +53,7 @@ func (p *pullFailures) WithGroup(string) slog.Handler      { return p }
 // for 90 s, past sqld's 60 s leeway on an expired token, with no failed pull
 // and every row a writer adds every 2 s.
 func TestGrantRenewalKeepsPulling(t *testing.T) {
-	s, signer := sqldtest.StartWithAuth(t)
+	s, signer := startScopePrimary(t)
 	dir := t.TempDir()
 	ctx := context.Background()
 	w, err := replica.Open(ctx, replica.Config{

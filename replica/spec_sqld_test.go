@@ -142,7 +142,7 @@ func TestReadOnlyReplicaReadsAndRefusesWrites(t *testing.T) {
 // A scope database opens only when its replicaScope row carries the spec's
 // digest and the grant names the spec's database.
 func TestReadOnlyScopeIsChecked(t *testing.T) {
-	s, signer := sqldtest.StartWithAuth(t)
+	s, signer := startScopePrimary(t)
 	dir := t.TempDir()
 	ro := signer.Token(map[string]any{"a": "ro", "exp": inMinutes(10)})
 	digest := make([]byte, 32)
@@ -156,16 +156,15 @@ func TestReadOnlyScopeIsChecked(t *testing.T) {
 			Credentials: grant{Token: ro, Database: grantDB, NotAfter: time.Now().Add(15 * time.Minute)},
 		}
 	}
-	if _, err := openSpec(t, spec("unscoped", digest, "orbtr-r-test")); !errors.Is(err, replica.ErrScopeMismatch) {
-		t.Errorf("a database with no replicaScope: err = %v, want ErrScopeMismatch", err)
-	}
-
 	w, err := openSpec(t, replica.Config{
 		Path: filepath.Join(dir, "writer.db"), URL: s.URL(), Mode: replica.ReadWrite,
 		Credentials: replica.StaticCredential(signer.Token(map[string]any{"exp": inMinutes(60)})),
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := openSpec(t, spec("unscoped", digest, "orbtr-r-test")); !errors.Is(err, replica.ErrScopeMismatch) {
+		t.Errorf("a database with no replicaScope: err = %v, want ErrScopeMismatch", err)
 	}
 	if _, err := w.DB().Exec("CREATE TABLE replicaScope (scopeDigest BLOB PRIMARY KEY CHECK (length(scopeDigest) = 32), partitionId TEXT NOT NULL) STRICT"); err != nil {
 		t.Fatal(err)

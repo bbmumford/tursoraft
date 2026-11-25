@@ -9,7 +9,10 @@
 // Config is a replica's spec: its file, its primary, its mode, where its
 // credential comes from, its key and, for a scope database, the scope it must
 // hold. Every part is required and every refusal fails the open: there is no
-// default mode, no fallback to an older credential, and no wider replica.
+// default mode, no fallback to an older credential, and no wider replica. A
+// scope database's replica must carry, in its header, the file identity its
+// primary was stamped with when it was created (filekind's scopeReplica kind):
+// it is checked at open and never stamped by its holder.
 //
 // The pool proves foreign keys on each physical connection when it opens, and
 // refuses every statement that would turn them off, for the connection's whole
@@ -61,6 +64,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bbmumford/policypool"
 	"github.com/bbmumford/tursoraft/database"
 )
 
@@ -324,8 +328,9 @@ type Replica struct {
 
 // Open validates cfg, takes and checks its credential, deletes a plaintext
 // replica file, opens the replica, retrying an unreachable primary until the
-// open timeout, wraps it in a pool, checks a scope database's replicaScope
-// row against cfg.Scope, and starts the sync loop.
+// open timeout, wraps it in a pool, checks a scope database's file identity
+// (scopeIdentity: refused with policypool.ErrFileIdentity, never stamped) and
+// its replicaScope row against cfg.Scope, and starts the sync loop.
 //
 // A ReadWrite pool proves foreign keys on every connection; a ReadOnly pool
 // proves on every connection that the engine refuses a write itself.
@@ -378,9 +383,12 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 		// The engine pulled once inside the open.
 		lastPull: time.Now(),
 	}
-	db, err := openPool(ctx, cfg.Mode, currentConnector{r})
+	db, err := openPool(ctx, cfg, currentConnector{r})
 	if err != nil {
 		n.Close()
+		if errors.Is(err, policypool.ErrFileIdentity) {
+			return nil, fmt.Errorf("tursoraft/replica: %s does not carry the scope database file identity: %w", cfg.Scope.Database, err)
+		}
 		return nil, fmt.Errorf("tursoraft/replica: pool for %s: %w", cfg.Path, err)
 	}
 	db.SetMaxIdleConns(PoolSize)

@@ -135,8 +135,12 @@ are not read-only (`a` must be `ro`, `p` may hold only `ro` and `roa`, `exp`
 must lie within one 15-minute grant plus a minute, and every database it names
 must be the scope's, by name or by the primary's own id for it: Turso's
 database tokens name the database only by that id, which the grant carries as
-`DatabaseID`). After the open, the scope database's
-`replicaScope` row must carry the spec's digest. go-libsql's `WithReadOnly`
+`DatabaseID`). After the open, the replica must carry the scope database file
+identity in its header (filekind's `scopeReplica` kind at the format generation
+this package reads), which the primary was stamped with when it was created:
+it is checked through policypool and never stamped on the copy, and any other
+header is refused with `policypool.ErrFileIdentity`. The scope database's
+`replicaScope` row must then carry the spec's digest. go-libsql's `WithReadOnly`
 gate refuses every statement it would send to the primary, and every pooled
 connection proves it refuses a write itself before it is used.
 
