@@ -55,9 +55,9 @@ func decodeClaims(token string) (claims tokenClaims, ok bool) {
 // one grant lifetime: "a" is "ro"; "p", when present, holds only the "ro" and
 // "roa" scopes (ErrWriteCapableToken); "exp" is present and no further ahead
 // than GrantLifetime plus tokenSkew (ErrTokenOutlivesGrant); and for a scope
-// database, every database its "id" and its scopes' "ns" lists name is that
-// database, named by Scope.Database or by the grant's databaseID
-// (ErrGrantMismatch). sqld's tokens name a namespace by name; Turso's minted
+// database, it names at least one database, and every database its "id" and
+// its scopes' "ns" lists name is that database, named by Scope.Database or by
+// the grant's databaseID (ErrGrantMismatch). sqld's tokens name a namespace by name; Turso's minted
 // database tokens name the database only by Turso's id for it, which the
 // holder cannot derive from the scope, so the grant carries it.
 //
@@ -105,6 +105,9 @@ func (c Config) checkToken(token, databaseID string, now time.Time) error {
 		return nil
 	}
 	names := func(db string) bool { return db == c.Scope.Database || databaseID != "" && db == databaseID }
+	// The token must name a database, and only the scope's: a token naming
+	// none would hold the check below vacuously.
+	named := claims.ID != nil
 	if claims.ID != nil && !names(*claims.ID) {
 		return fmt.Errorf("%w: the token's id claim names %q, the spec %q and the grant's database id %q", ErrGrantMismatch, *claims.ID, c.Scope.Database, databaseID)
 	}
@@ -119,7 +122,11 @@ func (c Config) checkToken(token, databaseID string, now time.Time) error {
 			if !names(ns) {
 				return fmt.Errorf("%w: the token's %q scope names %q, the spec %q and the grant's database id %q", ErrGrantMismatch, scope, ns, c.Scope.Database, databaseID)
 			}
+			named = true
 		}
+	}
+	if !named {
+		return fmt.Errorf("%w: the token names no database, so it is not shown to be the scope's %q", ErrGrantMismatch, c.Scope.Database)
 	}
 	return nil
 }

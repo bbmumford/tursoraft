@@ -69,7 +69,7 @@ func TestRequestPullReturnsAtThePosition(t *testing.T) {
 	r, err := replica.Open(ctx, replica.Config{
 		Path: filepath.Join(dir, "device.db"), URL: s.URL(), Mode: replica.ReadOnly, Key: make([]byte, 32),
 		Scope:        replica.Scope{Database: "orbtr-r-test", Digest: digest},
-		Credentials:  grant{Token: signer.Token(map[string]any{"a": "ro", "exp": time.Now().Add(10 * time.Minute).Unix()}), Database: "orbtr-r-test", NotAfter: time.Now().Add(15 * time.Minute)},
+		Credentials:  grant{Token: signer.Token(map[string]any{"a": "ro", "exp": time.Now().Add(10 * time.Minute).Unix(), "id": "default"}), Database: "orbtr-r-test", DatabaseID: "default", NotAfter: time.Now().Add(15 * time.Minute)},
 		SyncInterval: time.Hour, OpenTimeout: 10 * time.Second,
 	})
 	if err != nil {

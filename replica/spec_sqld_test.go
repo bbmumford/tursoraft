@@ -144,7 +144,8 @@ func TestReadOnlyReplicaReadsAndRefusesWrites(t *testing.T) {
 func TestReadOnlyScopeIsChecked(t *testing.T) {
 	s, signer := startScopePrimary(t)
 	dir := t.TempDir()
-	ro := signer.Token(map[string]any{"a": "ro", "exp": inMinutes(10)})
+	// sqld serves the scope primary as its default namespace; the token names it by that id.
+	ro := signer.Token(map[string]any{"a": "ro", "exp": inMinutes(10), "id": "default"})
 	digest := make([]byte, 32)
 	digest[0] = 0xd1
 	other := make([]byte, 32)
@@ -153,7 +154,7 @@ func TestReadOnlyScopeIsChecked(t *testing.T) {
 		return replica.Config{
 			Path: filepath.Join(dir, name+".db"), URL: s.URL(), Mode: replica.ReadOnly,
 			Scope:       replica.Scope{Database: "orbtr-r-test", Digest: d},
-			Credentials: grant{Token: ro, Database: grantDB, NotAfter: time.Now().Add(15 * time.Minute)},
+			Credentials: grant{Token: ro, Database: grantDB, DatabaseID: "default", NotAfter: time.Now().Add(15 * time.Minute)},
 		}
 	}
 	w, err := openSpec(t, replica.Config{

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bbmumford/filekind"
 	libsql "github.com/bbmumford/go-libsql"
@@ -107,7 +108,8 @@ func TestScopeReplicaChecksItsPrimarysFileIdentity(t *testing.T) {
 			cfg := httpSyncSpec(filepath.Join(t.TempDir(), "replica.db"), url, httpSyncKey(t))
 			if !c.whole {
 				cfg.Scope = identityScope
-				cfg.Credentials = fixedSource{c: Credential{Token: mustToken(cfg), Database: identityScope.Database}}
+				token := unsignedToken(map[string]any{"a": "ro", "exp": time.Now().Add(10 * time.Minute).Unix(), "id": identityScope.Database})
+				cfg.Credentials = fixedSource{c: Credential{Token: token, Database: identityScope.Database}}
 			}
 			for attempt := 1; attempt <= 2; attempt++ {
 				r, err := Open(context.Background(), cfg)

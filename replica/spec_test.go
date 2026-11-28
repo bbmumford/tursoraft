@@ -124,7 +124,7 @@ func (f fixedSource) Credential(context.Context) (Credential, error) { return f.
 
 func TestAdmitCredential(t *testing.T) {
 	now := time.Now()
-	ro := unsignedToken(map[string]any{"a": "ro", "exp": now.Add(10 * time.Minute).Unix()})
+	ro := unsignedToken(map[string]any{"a": "ro", "exp": now.Add(10 * time.Minute).Unix(), "id": "orbtr-r-aa"})
 	scope := Scope{Database: "orbtr-r-aa", Digest: make([]byte, 32)}
 	cases := []struct {
 		name string

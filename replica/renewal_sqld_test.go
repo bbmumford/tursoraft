@@ -33,7 +33,13 @@ func (g *signedGrants) Credential(context.Context) (replica.Credential, error) {
 		return replica.Credential{}, errors.New("the grant host refuses")
 	}
 	notAfter := time.Now().Add(g.life)
-	return replica.Credential{Token: g.signer.Token(map[string]any{"a": "ro", "exp": notAfter.Unix()}), NotAfter: notAfter, Database: g.database}, nil
+	claims := map[string]any{"a": "ro", "exp": notAfter.Unix()}
+	id := ""
+	if g.database != "" {
+		// sqld serves the scope primary as its default namespace; the token names it by that id.
+		claims["id"], id = "default", "default"
+	}
+	return replica.Credential{Token: g.signer.Token(claims), NotAfter: notAfter, Database: g.database, DatabaseID: id}, nil
 }
 
 // pullFailures counts the replica's warnings that a pull or a renewal failed.
