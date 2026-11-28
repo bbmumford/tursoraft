@@ -6,11 +6,27 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // ErrNoPosition means the replica holds a whole database, which records no
 // source position; RequestPull and WatchPosition need a scope database.
 var ErrNoPosition = errors.New("tursoraft/replica: a whole-database replica records no source position")
+
+// ErrPositionNotReached is RequestPull's answer when its context carries no
+// deadline and the replica has not recorded the position after pulling for
+// DefaultRequestPullTimeout.
+var ErrPositionNotReached = errors.New("tursoraft/replica: the replica did not reach the requested position")
+
+// DefaultRequestPullTimeout bounds a RequestPull whose context carries no
+// deadline. A position the primary never reaches (a request naming a position
+// of another segment, or one past the projector's) would otherwise keep the
+// caller, and a pull every SyncGap, going for as long as the replica is open;
+// the timed pull loop keeps the replica current meanwhile.
+const DefaultRequestPullTimeout = 2 * time.Minute
+
+// requestPullTimeout is DefaultRequestPullTimeout; tests shorten it.
+var requestPullTimeout = DefaultRequestPullTimeout
 
 // queryPosition reads the source position a scope database records: its
 // replicaProgress row's sourceCursor, the position in the source database's
@@ -99,10 +115,18 @@ func (r *Replica) Position() uint64 {
 // pulled for again until it arrives or ctx ends. It returns ctx's error when
 // ctx ends first, ErrNoPosition for a whole-database replica, and the pull's
 // error when the replica can pull no further (ErrClosed, ErrGrantExpired,
-// ErrPlaintextReplica); any other failed pull is tried again.
+// ErrPlaintextReplica); any other failed pull is tried again. A ctx with no
+// deadline is bounded by DefaultRequestPullTimeout, after which RequestPull
+// answers ErrPositionNotReached.
 func (r *Replica) RequestPull(ctx context.Context, atLeastPosition uint64) error {
 	if r.readPosition == nil {
 		return ErrNoPosition
+	}
+	caller := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, requestPullTimeout)
+		defer cancel()
 	}
 	for {
 		if r.Position() >= atLeastPosition {
@@ -111,8 +135,10 @@ func (r *Replica) RequestPull(ctx context.Context, atLeastPosition uint64) error
 		err := r.Sync(ctx)
 		switch {
 		case err == nil:
+		case caller.Err() != nil:
+			return caller.Err()
 		case ctx.Err() != nil:
-			return ctx.Err()
+			return fmt.Errorf("%w: position %d after %v (at %d)", ErrPositionNotReached, atLeastPosition, requestPullTimeout, r.Position())
 		case errors.Is(err, ErrClosed), errors.Is(err, ErrGrantExpired), errors.Is(err, ErrPlaintextReplica):
 			return err
 		}
