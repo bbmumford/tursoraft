@@ -543,9 +543,11 @@ func refuseUnencrypted(path string, n native, log *slog.Logger) error {
 // unencrypted reports why the replica at path is to be taken as unencrypted,
 // or "" when it is not. Page 1 of an unencrypted SQLite database begins with
 // the SQLite header and an encrypted one's does not, so page 1 is judged
-// wherever it is: in the database file, or, before the engine has written it
-// there, in the first WAL frame that holds it. A replica with page 1 in
-// neither has written no page, and is kept. Neither the HTTP sync protocol's
+// wherever it is: in the database file, and in every WAL frame that holds it,
+// whether or not the database file holds it too, because a reader takes page 1
+// from the WAL's newest frame of it over the file. A replica with page 1 in
+// neither has written no page, and is kept. Pages other than page 1 carry no
+// header to judge them by. Neither the HTTP sync protocol's
 // -info file nor any other companion is judged: a keyed replica on that
 // protocol keeps one beside an encrypted database file.
 func unencrypted(path string) (string, error) {
@@ -553,17 +555,14 @@ func unencrypted(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(head) == len(sqliteHeader) {
-		if bytes.Equal(head, sqliteHeader) {
-			return "the database file begins with the unencrypted SQLite header", nil
-		}
-		return "", nil
+	if len(head) == len(sqliteHeader) && bytes.Equal(head, sqliteHeader) {
+		return "the database file begins with the unencrypted SQLite header", nil
 	}
-	head, err = walPageOne(path + "-wal")
+	plain, err := walPageOneUnencrypted(path + "-wal")
 	if err != nil {
 		return "", err
 	}
-	if bytes.Equal(head, sqliteHeader) {
+	if plain {
 		return "page 1 in the WAL begins with the unencrypted SQLite header", nil
 	}
 	return "", nil
@@ -596,50 +595,52 @@ const (
 	walFrameHeaderSize = 24
 )
 
-// walPageOne returns the first bytes of page 1 as the first WAL frame holding
-// it carries them, or nothing when the file at path is missing, is not a WAL,
-// or holds no frame of page 1.
-func walPageOne(path string) ([]byte, error) {
+// walPageOneUnencrypted reports whether any WAL frame of page 1 in the file at
+// path begins with the unencrypted SQLite header; false when the file is
+// missing, is not a WAL, or holds no frame of page 1.
+func walPageOneUnencrypted(path string) (bool, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return false, nil
 	}
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 	defer f.Close()
 	hdr := make([]byte, walHeaderSize)
 	if _, err := f.ReadAt(hdr, 0); err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, nil
+			return false, nil
 		}
-		return nil, err
+		return false, err
 	}
 	if magic := binary.BigEndian.Uint32(hdr[0:4]); magic != 0x377f0682 && magic != 0x377f0683 {
-		return nil, nil
+		return false, nil
 	}
 	pageSize := int64(binary.BigEndian.Uint32(hdr[8:12]))
 	if pageSize == 1 {
 		pageSize = 65536
 	}
 	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 {
-		return nil, nil
+		return false, nil
 	}
 	frame := make([]byte, walFrameHeaderSize)
 	for off := int64(walHeaderSize); ; off += walFrameHeaderSize + pageSize {
 		if _, err := f.ReadAt(frame, off); err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil, nil
+				return false, nil
 			}
-			return nil, err
+			return false, err
 		}
 		if binary.BigEndian.Uint32(frame[0:4]) == 1 {
 			head := make([]byte, len(sqliteHeader))
 			n, err := f.ReadAt(head, off+walFrameHeaderSize)
 			if err != nil && !errors.Is(err, io.EOF) {
-				return nil, err
+				return false, err
 			}
-			return head[:n], nil
+			if bytes.Equal(head[:n], sqliteHeader) {
+				return true, nil
+			}
 		}
 	}
 }

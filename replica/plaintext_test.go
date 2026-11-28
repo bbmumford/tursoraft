@@ -219,7 +219,9 @@ func TestUnencryptedJudgesPageOne(t *testing.T) {
 		{name: "empty file, encrypted page 1 in the WAL", main: []byte{}, wal: []uint32{1}, walHead: random[:16]},
 		{name: "empty file, a WAL without page 1", main: []byte{}, wal: []uint32{2, 3}},
 		{name: "short file, unencrypted page 1 in the WAL", main: fixture[:10], wal: []uint32{1}, walHead: sqliteHeader, refused: true},
-		{name: "encrypted file, unencrypted page 1 in the WAL", main: random, wal: []uint32{1}, walHead: sqliteHeader},
+		{name: "encrypted file, unencrypted page 1 in the WAL", main: random, wal: []uint32{1}, walHead: sqliteHeader, refused: true},
+		{name: "encrypted file, encrypted page 1 in the WAL", main: random, wal: []uint32{1}, walHead: random[:16]},
+		{name: "encrypted file, a WAL without page 1", main: random, wal: []uint32{2, 3}},
 	}
 	for _, tc := range cases {
 		dir := t.TempDir()
