@@ -3,8 +3,8 @@
 //
 // Consumed by the Manager for a pureLocal group's databases (OpenFile, kind
 // tursoraftLocal), by connectors.MakeConnector (Open), by loom's node runtime
-// for its LAD file (OpenFile, kind lad), and by the replica package, which
-// calls IsPlaintext before it opens a replica. One opener serves several
+// for its LAD file (OpenFile, kind lad); Open and OpenFile call IsPlaintext
+// themselves before the engine opens the file. One opener serves several
 // kinds of file, so the kind comes from the caller. A local file is
 // authoritative: nothing else holds its rows, so nothing here ever deletes
 // one.
