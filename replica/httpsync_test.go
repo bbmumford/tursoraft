@@ -248,10 +248,12 @@ func TestOpenServesAKeyedReplicaOnHTTPSync(t *testing.T) {
 }
 
 // A replica the engine left unencrypted on the HTTP sync path is refused after
-// the open: the engine is closed and nothing is served.
+// the open: the engine is closed, nothing is served, and the database file and
+// every companion the HTTP sync path wrote are deleted before Open returns.
 func TestReplicaRefusesPlaintextFileAfterOpen(t *testing.T) {
 	url := httpSyncPrimary(t)
-	path := filepath.Join(t.TempDir(), "r.db")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "r.db")
 	closed := withKeylessEngine(t)
 
 	r, err := Open(context.Background(), httpSyncSpec(path, url, httpSyncKey(t)))
@@ -266,11 +268,17 @@ func TestReplicaRefusesPlaintextFileAfterOpen(t *testing.T) {
 	if !closed.Load() {
 		t.Error("the engine was left open")
 	}
-	requireHTTPSyncLayout(t, path, true)
+	for _, suffix := range replicaFiles {
+		if _, err := os.Stat(path + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("r.db%s is still on disk after the refusal (stat: %v)", suffix, err)
+		}
+	}
+	if leaks := httpSyncLeaks(t, dir); len(leaks) != 0 {
+		t.Fatalf("plaintext rows left on disk after the refusal: %v", leaks)
+	}
 }
 
-// The next Open after such a refusal deletes the unencrypted database file and
-// every companion the HTTP sync path wrote before the engine opens, and the
+// Such a refusal leaves no file holding a row in plaintext, and the next Open's
 // keyed engine downloads the replica again, encrypted.
 func TestTheNextOpenReplacesAPlaintextReplicaOnHTTPSync(t *testing.T) {
 	url := httpSyncPrimary(t)
@@ -286,8 +294,8 @@ func TestTheNextOpenReplacesAPlaintextReplicaOnHTTPSync(t *testing.T) {
 		}
 		t.Fatalf("setup: the keyless engine's replica: err = %v, want ErrPlaintextReplica", err)
 	}
-	if len(httpSyncLeaks(t, dir)) == 0 {
-		t.Fatal("setup: no file the keyless engine left holds a row in plaintext")
+	if leaks := httpSyncLeaks(t, dir); len(leaks) != 0 {
+		t.Fatalf("the refusal left plaintext rows on disk: %v", leaks)
 	}
 
 	openNative = keyed

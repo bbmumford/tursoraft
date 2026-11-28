@@ -70,7 +70,8 @@ func (r *Replica) renew() {
 // puts it in place. The file, its -client_wal_index and the frame they record
 // stay, so the new engine resumes from them rather than downloading again,
 // and nothing deletes the file first: a file the engine leaves unencrypted is
-// refused after the open (refuseUnencrypted), which ends the replica.
+// refused and deleted after the open (refuseUnencrypted), which ends the
+// replica.
 func (r *Replica) openEngineAgain(token string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), r.openTimeout())
 	defer cancel()

@@ -35,8 +35,10 @@
 // carry the key through its HTTP sync protocol, which the engine takes
 // whenever the primary answers it, opens the file without it and writes it
 // unencrypted. So the file is checked after every open, and a file left
-// unencrypted is closed and refused (ErrPlaintextReplica): it is never served,
-// and the next Open deletes it before the engine opens it again.
+// unencrypted is closed, deleted at once with its WAL, shared-memory index and
+// the engine's other companion files, and refused (ErrPlaintextReplica): it is
+// never served and its rows do not stay on disk; the next Open downloads the
+// replica again.
 //
 // Consumed by the Manager for every database of a shared group, and by
 // connectors.MakeConnector given a primary URL. The replica file is a cache:
@@ -119,7 +121,8 @@ var (
 	// ErrPlaintextReplica means the engine left the replica file unencrypted
 	// although it was given the key, or in a state that cannot be told apart
 	// from that, or that the file could not be read to check. The engine is
-	// closed and nothing is served from the file.
+	// closed, the file and its companions are deleted, and nothing is served
+	// from it.
 	ErrPlaintextReplica = errors.New("tursoraft/replica: the engine left the replica file unencrypted under a configured key")
 	// ErrNoMode means Config.Mode is neither ReadWrite nor ReadOnly.
 	ErrNoMode = errors.New("tursoraft/replica: the spec names no mode")
@@ -486,10 +489,10 @@ func (c Config) syncInterval() time.Duration {
 var replicaFiles = []string{"", "-wal", "-shm", "-client_wal_index", "-info"}
 
 // removePlaintext deletes the replica and its companion files when the
-// replica is to be taken as unencrypted (unencrypted), the judgement
-// refuseUnencrypted makes after an open, so every replica it refused is
-// replaced here, whether its unencrypted page 1 is in the database file or
-// only in the WAL. The engine would otherwise open it unencrypted, or fail on
+// replica is to be taken as unencrypted (unencrypted): before an open, and
+// from refuseUnencrypted once the engine is closed, so a replica refused after
+// an open is gone before the refusal returns, whether its unencrypted page 1
+// is in the database file or only in the WAL. The engine would otherwise open it unencrypted, or fail on
 // it, under a configured key.
 func removePlaintext(path string, log *slog.Logger) error {
 	why, err := unencrypted(path)
@@ -512,9 +515,13 @@ func removePlaintext(path string, log *slog.Logger) error {
 var sqliteHeader = []byte("SQLite format 3\x00")
 
 // refuseUnencrypted checks the replica file the engine has just opened and
-// pulled into, and closes the engine and refuses when the file is to be taken
-// as unencrypted (unencrypted). The file is left where it is: the next Open's
-// removePlaintext deletes it before the engine opens it.
+// pulled into, and when the file is to be taken as unencrypted (unencrypted)
+// closes the engine, deletes the file and its companions at once through
+// removePlaintext, which judges the file the same way, and refuses. The engine
+// is closed first, so nothing it holds open writes the file again; the
+// deletion comes before the refusal returns, so the unencrypted rows are out
+// of reach by the time any caller learns of them. A deletion that fails is
+// reported beside the refusal.
 func refuseUnencrypted(path string, n native, log *slog.Logger) error {
 	why, err := unencrypted(path)
 	if err == nil && why == "" {
@@ -524,8 +531,13 @@ func refuseUnencrypted(path string, n native, log *slog.Logger) error {
 	if err != nil {
 		why = "it cannot be checked: " + err.Error()
 	}
-	log.Error("tursoraft: refused a replica the engine left unencrypted; it is not served", "path", path, "reason", why)
-	return fmt.Errorf("%w: %s: %s", ErrPlaintextReplica, path, why)
+	refusal := fmt.Errorf("%w: %s: %s", ErrPlaintextReplica, path, why)
+	if rmErr := removePlaintext(path, log); rmErr != nil {
+		log.Error("tursoraft: refused a replica the engine left unencrypted and could not delete it", "path", path, "reason", why, "err", rmErr)
+		return errors.Join(refusal, rmErr)
+	}
+	log.Error("tursoraft: refused a replica the engine left unencrypted; it is deleted and not served", "path", path, "reason", why)
+	return refusal
 }
 
 // unencrypted reports why the replica at path is to be taken as unencrypted,
