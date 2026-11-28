@@ -24,7 +24,8 @@ func renewalTime(c Credential, fetched time.Time) time.Time {
 }
 
 // renew asks the credential source for the next grant, checks it as Open
-// does, and reopens the engine under it. It runs on the loop, so it waits for
+// does, retires the old engine's connections, closes it, and reopens the
+// engine under the new grant. It runs on the loop, so it waits for
 // the pull in progress and holds the next one until it returns; the callers
 // waiting for that pull keep waiting. A grant that cannot be had or is refused
 // is asked for again one sync interval later, until the held grant ends, after
@@ -45,9 +46,14 @@ func (r *Replica) renew() {
 		r.log.Warn("tursoraft: grant renewal failed; asking again until the grant ends", "path", r.cfg.Path, "err", err)
 		return
 	}
+	// The old engine's connections are retired before it is closed: with
+	// retiredBelow past their generation, each reports itself invalid and
+	// database/sql discards it rather than run a read on a closed engine while
+	// the new one opens.
 	r.emu.Lock()
 	old := r.engine
 	r.engine = nil
+	r.retiredBelow.Store(r.gen.Load() + 1)
 	r.emu.Unlock()
 	r.mu.Lock()
 	r.cred, r.renewAt = next, renewalTime(next, fetched)
@@ -125,7 +131,8 @@ func (r *Replica) engineForPull() (native, error) {
 type currentConnector struct{ r *Replica }
 
 // connectBusyWait bounds how long Connect waits out an engine that refuses a
-// new connection because the database is locked. On libSQL's HTTP sync path
+// new connection because the database is locked, or the loop's reopen of the
+// engine under a renewed grant. On libSQL's HTTP sync path
 // the engine runs a statement as it opens each connection, and SQLite refuses
 // it with "database is locked" while the loop's pull holds the database; every
 // renewal swap retires the pool's connections, so the reads after it open new
@@ -134,14 +141,17 @@ var connectBusyWait = 5 * time.Second
 
 // Connect opens a connection on the current engine (connectOnce), opening it
 // again, with backoff and without holding emu, while the engine refuses
-// because the database is locked, until connectBusyWait has passed or ctx
-// ends; any other refusal is returned at once.
+// because the database is locked or the loop is reopening the engine under a
+// renewed grant, until connectBusyWait has passed or ctx ends; any other
+// refusal is returned at once. A renewal retires the old engine's connections
+// before it closes that engine, so the reads that follow open new ones, and
+// they wait here for the new engine rather than fail while it opens.
 func (c currentConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	deadline := time.Now().Add(connectBusyWait)
 	backoff := 2 * time.Millisecond
 	for {
 		conn, err := c.connectOnce(ctx)
-		if err == nil || !databaseLocked(err) || !time.Now().Before(deadline) {
+		if err == nil || !(databaseLocked(err) || errors.Is(err, errReopening)) || !time.Now().Before(deadline) {
 			return conn, err
 		}
 		wait := time.NewTimer(min(backoff, time.Until(deadline)))
@@ -202,9 +212,10 @@ type engineConn struct {
 	gen uint64
 }
 
-// IsValid is false once the loop has put another engine in place.
+// IsValid is false once the loop has retired the connection's engine or put
+// another engine in place.
 func (c *engineConn) IsValid() bool {
-	if c.r.gen.Load() != c.gen {
+	if c.r.gen.Load() != c.gen || c.gen < c.r.retiredBelow.Load() {
 		return false
 	}
 	v, ok := c.Conn.(driver.Validator)
@@ -214,7 +225,7 @@ func (c *engineConn) IsValid() bool {
 // ResetSession has database/sql discard a connection of a replaced engine
 // before it hands it out again.
 func (c *engineConn) ResetSession(ctx context.Context) error {
-	if c.r.gen.Load() != c.gen {
+	if c.r.gen.Load() != c.gen || c.gen < c.r.retiredBelow.Load() {
 		return driver.ErrBadConn
 	}
 	if rs, ok := c.Conn.(driver.SessionResetter); ok {

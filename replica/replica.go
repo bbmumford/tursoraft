@@ -304,10 +304,14 @@ type Replica struct {
 	// currentConnector holds it shared while it connects, so no connection is
 	// ever made on an engine being closed. gen counts the engines the loop has
 	// put in place; a connection made on an earlier one is retired.
-	emu    sync.RWMutex
-	engine native // nil while the loop reopens it
-	failed error  // set when a reopened engine was refused; final
-	gen    atomic.Uint64
+	// retiredBelow is set by a renewal to one past the generation it is about
+	// to close, before it closes that engine: every connection of a generation
+	// below it is retired, so none is used while the engine under it closes.
+	emu          sync.RWMutex
+	engine       native // nil while the loop reopens it
+	failed       error  // set when a reopened engine was refused; final
+	gen          atomic.Uint64
+	retiredBelow atomic.Uint64
 
 	reqs chan chan error
 	stop chan struct{}
