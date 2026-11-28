@@ -5,8 +5,11 @@
 //	    Creates the database in GROUP when it does not exist, refuses one that
 //	    exists in another group, and prints the url for the signed document.
 //	    Reads the organisation token from TURSO_API_TOKEN.
-//	tursoraft-admin token -org ORG -db NAME [-expiration never] [-read-only]
-//	    Mints a token scoped to that one database and prints it.
+//	tursoraft-admin token -org ORG -db NAME [-expiration 1d] [-read-only]
+//	    Mints a token scoped to that one database and prints it. It expires
+//	    after one day unless -expiration names another lifetime; a token that
+//	    never expires, such as a host's static token, is asked for with
+//	    -expiration never.
 //	    Reads the organisation token from TURSO_API_TOKEN.
 //	tursoraft-admin fence-adopt -url URL -cluster ID -confirm-old-cluster-gone
 //	    Moves every fence row of the database to the cluster ID given, with
@@ -108,7 +111,7 @@ func token(ctx context.Context, args []string, getenv func(string) string, stdou
 	fs.SetOutput(stderr)
 	fs.String("org", "", "organisation")
 	db := fs.String("db", "", "database name")
-	expiration := fs.String("expiration", "never", "token lifetime in the platform's form")
+	expiration := fs.String("expiration", "1d", "token lifetime in the platform's form; never for one that does not expire")
 	readOnly := fs.Bool("read-only", false, "limit the token to reads")
 	if err := fs.Parse(args); err != nil {
 		return err

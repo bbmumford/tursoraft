@@ -109,7 +109,9 @@ func TestAPlatformRefusalShowsItsBody(t *testing.T) {
 	}
 }
 
-// A token is minted for one database, full access unless asked otherwise.
+// A token is minted for one database, full access unless asked otherwise, and
+// expires after one day unless asked otherwise: a token that never expires is
+// asked for by name.
 func TestTokenIsScopedToOneDatabase(t *testing.T) {
 	p := &fakePlatform{dbs: map[string]map[string]string{}}
 	srv := httptest.NewServer(p)
@@ -121,8 +123,14 @@ func TestTokenIsScopedToOneDatabase(t *testing.T) {
 	if strings.TrimSpace(out) != "minted-for-orbtr-sessions" {
 		t.Errorf("printed %q", out)
 	}
-	if !strings.Contains(p.lastReq, "/databases/orbtr-sessions/auth/tokens?") || !strings.Contains(p.lastReq, "authorization=full-access") || !strings.Contains(p.lastReq, "expiration=never") {
+	if !strings.Contains(p.lastReq, "/databases/orbtr-sessions/auth/tokens?") || !strings.Contains(p.lastReq, "authorization=full-access") || !strings.Contains(p.lastReq, "expiration=1d") {
 		t.Errorf("request %q", p.lastReq)
+	}
+	if code, _, errOut := admin(t, srv, "token", "-org", "orbtr", "-db", "orbtr-sessions", "-expiration", "never"); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if !strings.Contains(p.lastReq, "expiration=never") {
+		t.Errorf("request %q, want the never-expiring token asked for", p.lastReq)
 	}
 }
 
