@@ -56,7 +56,7 @@ func (r *Replica) renew() {
 	r.retiredBelow.Store(r.gen.Load() + 1)
 	r.emu.Unlock()
 	r.mu.Lock()
-	r.cred, r.renewAt = next, renewalTime(next, fetched)
+	r.cred, r.renewAt = boundLease(next, fetched), renewalTime(next, fetched)
 	r.mu.Unlock()
 	if old != nil {
 		old.Close()
@@ -183,6 +183,9 @@ func (c currentConnector) connectOnce(ctx context.Context) (driver.Conn, error) 
 	if r.engine == nil {
 		return nil, errReopening
 	}
+	if err := r.leaseError(); err != nil {
+		return nil, err
+	}
 	gen := r.gen.Load()
 	conn, err := r.engine.Connect(ctx)
 	if err != nil {
@@ -206,7 +209,10 @@ func (c currentConnector) Close() error {
 
 // engineConn is one connection of the engine numbered gen. It forwards the
 // statement methods of the engine's connection, which database/sql would
-// otherwise not see through the wrapper.
+// otherwise not see through the wrapper, each behind the offline-lease gate
+// (Replica.leaseError): once the grant and its lease have ended, every
+// statement and transaction is refused with ErrLeaseEnded before the engine
+// is asked, on the connections already open as on new ones.
 type engineConn struct {
 	driver.Conn
 	r   *Replica
@@ -236,6 +242,9 @@ func (c *engineConn) ResetSession(ctx context.Context) error {
 }
 
 func (c *engineConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if err := c.r.leaseError(); err != nil {
+		return nil, err
+	}
 	if e, ok := c.Conn.(driver.ExecerContext); ok {
 		return e.ExecContext(ctx, query, args)
 	}
@@ -243,6 +252,9 @@ func (c *engineConn) ExecContext(ctx context.Context, query string, args []drive
 }
 
 func (c *engineConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if err := c.r.leaseError(); err != nil {
+		return nil, err
+	}
 	if q, ok := c.Conn.(driver.QueryerContext); ok {
 		return q.QueryContext(ctx, query, args)
 	}
@@ -250,13 +262,24 @@ func (c *engineConn) QueryContext(ctx context.Context, query string, args []driv
 }
 
 func (c *engineConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if err := c.r.leaseError(); err != nil {
+		return nil, err
+	}
 	if p, ok := c.Conn.(driver.ConnPrepareContext); ok {
 		return p.PrepareContext(ctx, query)
 	}
 	return c.Conn.Prepare(query)
 }
 
+// Prepare is PrepareContext with no context, behind the same gate.
+func (c *engineConn) Prepare(query string) (driver.Stmt, error) {
+	return c.PrepareContext(context.Background(), query)
+}
+
 func (c *engineConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if err := c.r.leaseError(); err != nil {
+		return nil, err
+	}
 	if b, ok := c.Conn.(driver.ConnBeginTx); ok {
 		return b.BeginTx(ctx, opts)
 	}

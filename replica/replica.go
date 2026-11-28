@@ -124,6 +124,11 @@ var (
 	// closed, the file and its companions are deleted, and nothing is served
 	// from it.
 	ErrPlaintextReplica = errors.New("tursoraft/replica: the engine left the replica file unencrypted under a configured key")
+	// ErrLeaseEnded means a read was refused because the replica's grant has
+	// ended and its offline lease has ended too, or the lease clock could not
+	// say it has not. The file is kept for the next grant, which renews the
+	// lease.
+	ErrLeaseEnded = errors.New("tursoraft/replica: the grant and the offline lease have ended; reads wait for the next grant")
 	// ErrNoMode means Config.Mode is neither ReadWrite nor ReadOnly.
 	ErrNoMode = errors.New("tursoraft/replica: the spec names no mode")
 	// ErrNoCredential means Config.Credentials is nil.
@@ -170,6 +175,45 @@ const (
 	tokenSkew     = time.Minute
 )
 
+// MaxOfflineLease is the longest offline lease a grant may carry: a
+// credential's LeaseNotAfter further than this past its fetch is held to it.
+// The partition policy that sets the lease defaults to 7 days and refuses more
+// than this; the replica holds the bound itself so a grant that carried more
+// is not served longer.
+const MaxOfflineLease = 30 * 24 * time.Hour
+
+// boundLease holds cred's offline lease to MaxOfflineLease past fetched.
+func boundLease(cred Credential, fetched time.Time) Credential {
+	if limit := fetched.Add(MaxOfflineLease); cred.LeaseNotAfter.After(limit) {
+		cred.LeaseNotAfter = limit
+	}
+	return cred
+}
+
+// leaseError is nil while the replica may serve a read: always under a
+// credential that does not expire, and otherwise while the grant is live or
+// its offline lease runs, both judged by the lease clock (Config.Clock). A
+// clock error refuses, as an ended lease does.
+func (r *Replica) leaseError() error {
+	r.mu.Lock()
+	cred := r.cred
+	r.mu.Unlock()
+	if cred.NotAfter.IsZero() {
+		return nil
+	}
+	now := time.Now()
+	if r.cfg.Clock != nil {
+		var err error
+		if now, err = r.cfg.Clock(); err != nil {
+			return fmt.Errorf("%w: the lease clock: %v", ErrLeaseEnded, err)
+		}
+	}
+	if now.Before(cred.NotAfter) || now.Before(cred.LeaseNotAfter) {
+		return nil
+	}
+	return ErrLeaseEnded
+}
+
 // Credential is what a replica authenticates its pulls with.
 type Credential struct {
 	// Token is the primary's bearer token. Empty sends none, which only a
@@ -179,7 +223,9 @@ type Credential struct {
 	// expire, such as a host's static token.
 	NotAfter time.Time
 	// LeaseNotAfter is the end of the offline lease that came with the
-	// grant; zero when none came.
+	// grant; zero when none came. With no live grant the replica serves reads
+	// only before it (the lease gate, leaseError), held to MaxOfflineLease
+	// past the grant's fetch; zero leaves reads to the grant's own life.
 	LeaseNotAfter time.Time
 	// GrantID names the grant; empty for a static credential.
 	GrantID string
@@ -249,6 +295,12 @@ type Config struct {
 	SyncInterval time.Duration
 	// OpenTimeout bounds Open's retries; zero means DefaultOpenTimeout.
 	OpenTimeout time.Duration
+	// Clock is the time the offline lease is judged by; nil means the wall
+	// clock. A device holder passes keyprotect's tamper-evident monotonic
+	// clock, whose error for a wall clock wound back behind its high-water
+	// mark ends the lease until the next grant: every read is refused while
+	// the clock answers an error.
+	Clock func() (time.Time, error)
 	// Logger receives plaintext deletions, retries and sync failures; nil
 	// means slog.Default.
 	Logger *slog.Logger
@@ -368,6 +420,7 @@ func Open(ctx context.Context, cfg Config) (*Replica, error) {
 	if err := cfg.admit(cred, time.Now()); err != nil {
 		return nil, err
 	}
+	cred = boundLease(cred, fetched)
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return nil, fmt.Errorf("tursoraft/replica: %w", err)
 	}
